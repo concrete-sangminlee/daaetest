@@ -139,8 +139,12 @@ def build_slack_summary_text(
       - 제목  (Fri, 02 Jan 2026 11:00:58 +0000)
     """
     count = len(posts)
-    test_prefix = "[TEST] " if is_test else ""
-    header = f"{emoji} {test_prefix}{feed_name} 새 글 {count}개"
+    # 사용자 요청: 헤더에 [TEST]는 표시하지 않음
+    # 사용자 요청: '건축학과'는 볼드 처리
+    display_name = (feed_name or "").strip()
+    display_name = _slack_escape(display_name)
+    display_name = display_name.replace("건축학과", "*건축학과*")
+    header = f"{emoji} {display_name} 새 글 {count}개"
 
     lines = [header]
     for p in posts:
