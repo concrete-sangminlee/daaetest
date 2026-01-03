@@ -103,6 +103,77 @@ def _format_dt_z(dt: datetime) -> str:
     return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _format_post_time_labels(date_gmt: str) -> str:
+    """
+    Slack에 표시할 시간 라벨을 만듭니다.
+    - WordPress API의 date_gmt(UTC)를 기준으로
+    - 가능하면 KST(Asia/Seoul)도 같이 표기합니다.
+    """
+    dt_utc = _parse_wp_date_gmt(date_gmt)
+    utc_label = dt_utc.replace(microsecond=0).strftime("%Y-%m-%d %H:%M UTC")
+
+    try:
+        # zoneinfo는 Python 3.9+ 표준 라이브러리입니다.
+        from zoneinfo import ZoneInfo  # type: ignore
+
+        dt_kst = dt_utc.astimezone(ZoneInfo("Asia/Seoul"))
+        kst_label = dt_kst.replace(microsecond=0).strftime("%Y-%m-%d %H:%M KST")
+        return f"{kst_label} ({utc_label})"
+    except Exception:
+        return utc_label
+
+
+def build_slack_blocks_for_post(
+    *,
+    title: str,
+    link: str,
+    date_gmt: str,
+    post_id: int,
+    is_test: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Slack Block Kit 기반으로 보기 좋은 메시지 블록을 생성합니다.
+    """
+    header = "[TEST] SNU Architecture 새 글 알림" if is_test else "SNU Architecture 새 글 알림"
+    time_label = _format_post_time_labels(date_gmt)
+    safe_title = title or "(제목 없음)"
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": header},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*<{link}|{safe_title}>*"},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "게시글 열기"},
+                    "url": link,
+                }
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"게시일: `{time_label}`"},
+                {"type": "mrkdwn", "text": f"ID: `{post_id}`"},
+            ],
+        },
+    ]
+    return blocks
+
+
+def build_slack_text_fallback(*, title: str, link: str, is_test: bool) -> str:
+    prefix = "[TEST] " if is_test else ""
+    safe_title = title or "(제목 없음)"
+    return f"{prefix}새 글: {safe_title}\n{link}"
+
+
 def _requests_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
@@ -270,6 +341,7 @@ def send_slack_message(
     *,
     webhook_url: str,
     text: str,
+    blocks: Optional[List[Dict[str, Any]]] = None,
     channel: Optional[str] = None,
     username: Optional[str] = None,
     timeout_sec: float = 15.0,
@@ -279,6 +351,8 @@ def send_slack_message(
         "unfurl_links": False,
         "unfurl_media": False,
     }
+    if blocks:
+        payload["blocks"] = blocks
     if channel:
         payload["channel"] = channel
     if username:
@@ -287,6 +361,27 @@ def send_slack_message(
     resp = session.post(webhook_url, json=payload, timeout=timeout_sec)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Slack webhook 실패: HTTP {resp.status_code} / body={resp.text[:300]!r}")
+
+
+def fetch_latest_post(
+    session: requests.Session,
+    *,
+    base_url: str,
+    category_ids: List[int],
+) -> Optional[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "per_page": 1,
+        "page": 1,
+        "orderby": "date",
+        "order": "desc",
+        "_fields": "id,date_gmt,link,title",
+    }
+    if category_ids:
+        params["categories"] = ",".join(str(x) for x in category_ids)
+    posts = _wp_get_json(session, base_url=base_url, path=WP_POSTS_PATH, params=params)
+    if not posts:
+        return None
+    return posts[0]
 
 
 def make_stream_key(base_url: str, category_ids: List[int]) -> str:
@@ -329,6 +424,7 @@ class Config:
 
     dry_run: bool
     init_only: bool
+    test_latest: bool
 
 
 def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
@@ -375,6 +471,7 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         slack_username=slack_username,
         dry_run=bool(args.dry_run),
         init_only=bool(args.init),
+        test_latest=bool(args.test_latest),
     )
 
 
@@ -382,6 +479,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="architecture.snu.ac.kr 새 글 -> Slack 알림")
     p.add_argument("--init", action="store_true", help="최신 글을 기준점으로 저장만 하고 종료(초기화)")
     p.add_argument("--dry-run", action="store_true", help="Slack 전송 없이 콘솔에만 출력")
+    p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 [TEST]로 Slack에 전송(상태 저장 없음)")
 
     p.add_argument("--wp-base-url", default=None, help="기본: https://architecture.snu.ac.kr")
     p.add_argument("--watch-all", action="store_true", default=None, help="카테고리 필터 없이 전체 글 감시")
@@ -431,6 +529,41 @@ def run(cfg: Config) -> int:
     state = load_state(cfg.state_path)
     streams = state.setdefault("streams", {})
     stream = streams.get(stream_key)
+
+    # 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송
+    if cfg.test_latest:
+        latest = fetch_latest_post(session, base_url=cfg.wp_base_url, category_ids=category_ids)
+        if latest is None:
+            text = "[TEST] architecture.snu.ac.kr 최신 글 조회 결과: 게시물이 없습니다."
+            if cfg.dry_run:
+                print(text)
+                return 0
+            _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
+            send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
+            return 0
+
+        post_id = int(latest.get("id", 0))
+        title = _clean_text(str(latest.get("title", {}).get("rendered", "")))
+        link = str(latest.get("link", "")).strip()
+        date_gmt = str(latest.get("date_gmt", "")).strip()
+
+        blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=True)
+        text = build_slack_text_fallback(title=title, link=link, is_test=True)
+
+        if cfg.dry_run:
+            print(text)
+            return 0
+
+        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
+        send_slack_message(
+            session,
+            webhook_url=str(cfg.slack_webhook_url),
+            text=text,
+            blocks=blocks,
+            channel=cfg.slack_channel,
+            username=cfg.slack_username,
+        )
+        return 0
 
     # init 모드: 항상 최신 글 기준점으로 저장
     if cfg.init_only:
@@ -499,10 +632,12 @@ def run(cfg: Config) -> int:
             _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
 
         for p in posts:
+            post_id = int(p.get("id", 0))
             title = _clean_text(str(p.get("title", {}).get("rendered", "")))
             link = str(p.get("link", "")).strip()
             date_gmt = str(p.get("date_gmt", "")).strip()
-            text = f"[architecture.snu.ac.kr] 새 글 알림\n제목: {title}\nURL: {link}\n게시일(GMT): {date_gmt}"
+            blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=False)
+            text = build_slack_text_fallback(title=title, link=link, is_test=False)
             if cfg.dry_run:
                 print(text)
                 print("-" * 60)
@@ -511,6 +646,7 @@ def run(cfg: Config) -> int:
                     session,
                     webhook_url=str(cfg.slack_webhook_url),
                     text=text,
+                    blocks=blocks,
                     channel=cfg.slack_channel,
                     username=cfg.slack_username,
                 )
@@ -550,10 +686,12 @@ def run(cfg: Config) -> int:
         _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
 
     for p in posts:
+        post_id = int(p.get("id", 0))
         title = _clean_text(str(p.get("title", {}).get("rendered", "")))
         link = str(p.get("link", "")).strip()
         date_gmt = str(p.get("date_gmt", "")).strip()
-        text = f"[architecture.snu.ac.kr] 새 글 알림\n제목: {title}\nURL: {link}\n게시일(GMT): {date_gmt}"
+        blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=False)
+        text = build_slack_text_fallback(title=title, link=link, is_test=False)
         if cfg.dry_run:
             print(text)
             print("-" * 60)
@@ -562,6 +700,7 @@ def run(cfg: Config) -> int:
                 session,
                 webhook_url=str(cfg.slack_webhook_url),
                 text=text,
+                blocks=blocks,
                 channel=cfg.slack_channel,
                 username=cfg.slack_username,
             )

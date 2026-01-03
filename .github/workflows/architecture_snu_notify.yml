@@ -72,62 +72,7 @@ jobs:
           WP_BASE_URL: "https://architecture.snu.ac.kr"
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import html
-          import json
-          import os
-          import re
-          import urllib.parse
-          import urllib.request
-          
-          wp_base = os.environ.get("WP_BASE_URL", "https://architecture.snu.ac.kr").rstrip("/")
-          api = wp_base + "/wp-json/wp/v2/posts"
-          
-          params = {
-              "per_page": 1,
-              "page": 1,
-              "orderby": "date",
-              "order": "desc",
-              "_fields": "id,date_gmt,link,title",
-          }
-          url = api + "?" + urllib.parse.urlencode(params, doseq=True)
-          
-          req = urllib.request.Request(url, headers={"Accept": "application/json"})
-          with urllib.request.urlopen(req, timeout=20) as resp:
-              posts = json.load(resp)
-          
-          if not posts:
-              text = "[TEST] architecture.snu.ac.kr 최신 글 조회 결과: 게시물이 없습니다."
-          else:
-              p = posts[0]
-              title = p.get("title", {}).get("rendered", "") or ""
-              title = html.unescape(title)
-              title = re.sub(r"<[^>]+>", "", title)
-              title = re.sub(r"\s+", " ", title).strip()
-              link = (p.get("link") or "").strip()
-              date_gmt = (p.get("date_gmt") or "").strip()
-              pid = p.get("id")
-              text = (
-                  "[TEST] architecture.snu.ac.kr 최신 글 1건(사이트 전체 posts)\n"
-                  f"ID: {pid}\n"
-                  f"제목: {title}\n"
-                  f"URL: {link}\n"
-                  f"게시일(GMT): {date_gmt}"
-              )
-          
-          webhook = os.environ["SLACK_WEBHOOK_URL"]
-          payload = {"text": text, "unfurl_links": False, "unfurl_media": False}
-          data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-          req2 = urllib.request.Request(
-              webhook,
-              data=data,
-              headers={"Content-Type": "application/json; charset=utf-8"},
-              method="POST",
-          )
-          with urllib.request.urlopen(req2, timeout=20) as resp2:
-              out = resp2.read(200)
-          print(out.decode("utf-8", errors="replace"))
-          PY
+          python bot.py --test-latest
 
       - name: Run notifier
         env:
