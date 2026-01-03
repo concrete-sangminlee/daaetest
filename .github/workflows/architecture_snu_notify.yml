@@ -70,7 +70,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WP_BASE_URL: "https://architecture.snu.ac.kr"
-          ALERT_EMOJI: ":신문:"
+          ALERT_EMOJI: "📰"
           ALERT_FEED_NAME: "건축학과"
         run: |
           set -euo pipefail
@@ -81,7 +81,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           WP_WATCH_ALL: "true"
-          ALERT_EMOJI: ":신문:"
+          ALERT_EMOJI: "📰"
           ALERT_FEED_NAME: "건축학과"
           STATE_PATH: "./state.json"
           WP_PER_PAGE: "50"
