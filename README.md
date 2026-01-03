@@ -1,5 +1,5 @@
 ## 목표
-`architecture.snu.ac.kr`에 **새 글이 올라오면 Slack 채널로 자동 알림**을 보내는 스크립트입니다.
+`architecture.snu.ac.kr`에 **새 글이 올라오면 Slack(그리고 선택적으로 KakaoTalk)으로 자동 알림**을 보내는 스크립트입니다.
 
 이 프로젝트는 “봇을 계속 켜두는 방식”이 아니라, **주기적으로 실행되는 폴링(polling)** 스크립트로 설계되어 있습니다.
 즉, cron / GitHub Actions / 서버 스케줄러로 **10분마다 한 번 실행** 같은 형태로 운영하는 것을 권장합니다.
@@ -23,7 +23,7 @@
 - **cursor**: `(date_gmt, id)` 쌍
 - 저장 위치: 기본 `./state.json`
 
-매 실행 시 WordPress API에 “cursor 이후의 글”만 요청하고, 새 글이 있으면 Slack으로 보내고 커서를 갱신합니다.
+매 실행 시 WordPress API에 “cursor 이후의 글”만 요청하고, 새 글이 있으면 Slack/KakaoTalk으로 보내고 커서를 갱신합니다.
 
 ---
 
@@ -58,6 +58,25 @@ cp env.example .env
 
 - **SLACK_WEBHOOK_URL**: 필수
 - **WP_CATEGORY_SLUGS** 또는 **WP_CATEGORY_IDS**: 선택(기본은 공지사항 `notice`)
+
+### 3) KakaoTalk(나에게 보내기)으로도 알림 보내기(선택)
+이 스크립트는 KakaoTalk **“나에게 보내기” 메시지 API**로도 동일한 알림을 보낼 수 있습니다.
+
+- 필요한 값(2개)
+  - `KAKAO_REST_API_KEY`: Kakao Developers 앱의 REST API 키
+  - `KAKAO_REFRESH_TOKEN`: 사용자 OAuth refresh_token
+
+#### 토큰 발급(요약)
+KakaoTalk 메시지 API는 OAuth 동의가 필요합니다.
+
+1. Kakao Developers에서 앱 생성 후 REST API 키 확인
+2. OAuth 인가코드(authorization code)를 받은 뒤 토큰 교환으로 `refresh_token` 확보
+3. GitHub Actions를 쓸 경우 아래 Secret으로 등록
+   - `KAKAO_REST_API_KEY`
+   - `KAKAO_REFRESH_TOKEN`
+
+참고 문서(공식):
+- Kakao 메시지 REST API: `https://developers.kakao.com/docs/latest/ko/message/rest-api`
 
 ---
 
@@ -133,6 +152,12 @@ GitHub 레포 → **Settings** → **Secrets and variables** → **Actions** →
 
 > Webhook URL은 절대 코드/README에 커밋하지 마세요.
 
+### 1-1) (선택) KakaoTalk 토큰을 GitHub Secret으로 등록
+같은 워크플로우 실행에서 Slack과 **동시에 KakaoTalk으로도 전송**하려면 아래 Secret을 추가하세요.
+
+- Name: `KAKAO_REST_API_KEY`
+- Name: `KAKAO_REFRESH_TOKEN`
+
 ### 2) 워크플로우 수동 실행(테스트)
 GitHub 레포 → **Actions** 탭 → 워크플로우 선택 → **Run workflow**
 
@@ -146,7 +171,7 @@ GitHub Actions cache는 **best-effort**라서, 드물게 만료/정리되면 `st
 워크플로우는 수동 실행 시 입력값으로 아래 옵션을 제공합니다.
 
 - `ping=true`: Slack 연결 테스트 메시지 1건 전송
-- `test_post=true`: **사이트 전체 posts 기준 최신 글 1건을 `[TEST]`로 전송**
+- `test_post=true`: **사이트 전체 posts 기준 최신 글 1건을 전송** (Kakao 설정이 있으면 KakaoTalk에도 함께 전송)
 
 새 글이 없을 때도 end-to-end로 “WordPress API 조회 → Slack 전송”을 확인할 때 유용합니다.
 

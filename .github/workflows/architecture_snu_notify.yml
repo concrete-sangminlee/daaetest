@@ -12,7 +12,7 @@ on:
         required: false
         default: "true"
       test_post:
-        description: "수동 실행 시 최신 글 1건을 [TEST]로 Slack에 전송(사이트 전체 posts 기준)"
+        description: "수동 실행 시 최신 글 1건 전송(사이트 전체 posts 기준, Kakao 설정 시 KakaoTalk에도 함께 전송)"
         required: false
         default: "false"
 
@@ -69,6 +69,9 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_post == 'true' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          KAKAO_MAX_CHARS: "900"
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           ALERT_EMOJI: "📰"
           ALERT_FEED_NAME: "건축학과"
@@ -79,6 +82,9 @@ jobs:
       - name: Run notifier
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          KAKAO_MAX_CHARS: "900"
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           WP_WATCH_ALL: "true"
           ALERT_EMOJI: "📰"

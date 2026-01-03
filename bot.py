@@ -37,6 +37,10 @@ from dotenv import load_dotenv
 WP_POSTS_PATH = "/wp-json/wp/v2/posts"
 WP_CATEGORIES_PATH = "/wp-json/wp/v2/categories"
 
+# Kakao API (KakaoTalk "나에게 보내기")
+KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
+KAKAO_SEND_TO_ME_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+
 
 def _parse_bool(value: Optional[str], *, default: bool = False) -> bool:
     if value is None:
@@ -165,6 +169,129 @@ def build_slack_summary_text(
             lines.append(f"- {title_md}")
 
     return "\n".join(lines)
+
+
+def build_kakao_summary_text(
+    *,
+    posts: List[Dict[str, Any]],
+    feed_name: str,
+    emoji: str,
+    max_chars: int = 900,
+) -> str:
+    """
+    KakaoTalk용 요약 텍스트를 생성합니다.
+
+    - Kakao 템플릿(text)에는 길이 제한이 있어, 너무 길어지면 일부 글은 생략합니다.
+    - Slack과 달리 링크 숨김(<url|text>) 같은 문법이 없으므로 URL은 별도 줄로 넣습니다.
+    """
+    count = len(posts)
+    header_name = (feed_name or "").strip() or "알림"
+    header = f"{emoji} {header_name} 새 글 {count}개"
+
+    lines: List[str] = [header]
+    for i, p in enumerate(posts):
+        title = _clean_text(str(p.get("title", {}).get("rendered", ""))) or "(제목 없음)"
+        link = str(p.get("link", "")).strip()
+        date_gmt = str(p.get("date_gmt", "")).strip()
+        date_str = _format_rfc2822_utc(date_gmt) if date_gmt else ""
+
+        item_lines: List[str] = []
+        if date_str:
+            item_lines.append(f"- {title}  ({date_str})")
+        else:
+            item_lines.append(f"- {title}")
+        if link:
+            item_lines.append(f"  {link}")
+
+        candidate = "\n".join(lines + item_lines)
+        if len(candidate) > max_chars:
+            remaining = len(posts) - i
+            if remaining > 0:
+                lines.append(f"... 외 {remaining}개")
+            break
+
+        lines.extend(item_lines)
+
+    return "\n".join(lines)
+
+
+def _kakao_enabled(rest_api_key: Optional[str], refresh_token: Optional[str]) -> bool:
+    return bool((rest_api_key or "").strip()) and bool((refresh_token or "").strip())
+
+
+def kakao_refresh_access_token(
+    session: requests.Session,
+    *,
+    rest_api_key: str,
+    refresh_token: str,
+    timeout_sec: float = 15.0,
+) -> str:
+    """
+    Refresh Token으로 Access Token을 갱신합니다.
+    - 보안상 토큰 값은 로그로 출력하지 않습니다.
+    """
+    resp = session.post(
+        KAKAO_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": rest_api_key,
+            "refresh_token": refresh_token,
+        },
+        timeout=timeout_sec,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    access_token = data.get("access_token")
+    if not access_token:
+        raise RuntimeError("Kakao 토큰 갱신 실패: access_token이 응답에 없습니다.")
+
+    # Kakao는 경우에 따라 refresh_token을 재발급할 수 있습니다.
+    # GitHub Actions에서는 Secret을 자동 갱신할 수 없으므로, 갱신 필요 여부만 경고로 남깁니다.
+    if data.get("refresh_token"):
+        print(
+            "[WARN] Kakao refresh_token이 재발급된 것으로 보입니다. "
+            "새 refresh_token으로 GitHub Secret(KAKAO_REFRESH_TOKEN)을 업데이트해야 할 수 있습니다.",
+            file=sys.stderr,
+        )
+
+    return str(access_token)
+
+
+def send_kakao_to_me(
+    session: requests.Session,
+    *,
+    access_token: str,
+    text: str,
+    link: str,
+    button_title: str = "첫 글 열기",
+    timeout_sec: float = 15.0,
+) -> None:
+    """
+    KakaoTalk '나에게 보내기' 메시지 전송.
+    https://developers.kakao.com/docs/latest/ko/message/rest-api#default-template-send
+    """
+    template_object = {
+        "object_type": "text",
+        "text": text,
+        "link": {
+            "web_url": link,
+            "mobile_web_url": link,
+        },
+        "button_title": button_title,
+    }
+
+    resp = session.post(
+        KAKAO_SEND_TO_ME_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        data={"template_object": json.dumps(template_object, ensure_ascii=False)},
+        timeout=timeout_sec,
+    )
+    resp.raise_for_status()
+    out = resp.json()
+    # result_code: 0이면 성공
+    if str(out.get("result_code", "0")) != "0":
+        raise RuntimeError(f"Kakao 메시지 전송 실패: {out!r}")
 
 
 def _requests_session() -> requests.Session:
@@ -415,6 +542,10 @@ class Config:
     alert_feed_name: str
     alert_emoji: str
 
+    kakao_rest_api_key: Optional[str]
+    kakao_refresh_token: Optional[str]
+    kakao_max_chars: int
+
     dry_run: bool
     init_only: bool
     test_latest: bool
@@ -450,8 +581,12 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
     slack_channel = args.slack_channel or os.getenv("SLACK_CHANNEL")
     slack_username = args.slack_username or os.getenv("SLACK_USERNAME")
 
-    alert_feed_name = os.getenv("ALERT_FEED_NAME") or "서울대 건축학과"
-    alert_emoji = os.getenv("ALERT_EMOJI") or ":newspaper:"
+    alert_feed_name = os.getenv("ALERT_FEED_NAME") or "건축학과"
+    alert_emoji = os.getenv("ALERT_EMOJI") or "📰"
+
+    kakao_rest_api_key = (os.getenv("KAKAO_REST_API_KEY") or "").strip() or None
+    kakao_refresh_token = (os.getenv("KAKAO_REFRESH_TOKEN") or "").strip() or None
+    kakao_max_chars = int(os.getenv("KAKAO_MAX_CHARS") or 900)
 
     return Config(
         wp_base_url=wp_base_url,
@@ -467,6 +602,9 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         slack_username=slack_username,
         alert_feed_name=alert_feed_name,
         alert_emoji=alert_emoji,
+        kakao_rest_api_key=kakao_rest_api_key,
+        kakao_refresh_token=kakao_refresh_token,
+        kakao_max_chars=kakao_max_chars,
         dry_run=bool(args.dry_run),
         init_only=bool(args.init),
         test_latest=bool(args.test_latest),
@@ -477,7 +615,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="architecture.snu.ac.kr 새 글 -> Slack 알림")
     p.add_argument("--init", action="store_true", help="최신 글을 기준점으로 저장만 하고 종료(초기화)")
     p.add_argument("--dry-run", action="store_true", help="Slack 전송 없이 콘솔에만 출력")
-    p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 [TEST]로 Slack에 전송(상태 저장 없음)")
+    p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 테스트 전송(상태 저장 없음)")
 
     p.add_argument("--wp-base-url", default=None, help="기본: https://architecture.snu.ac.kr")
     p.add_argument("--watch-all", action="store_true", default=None, help="카테고리 필터 없이 전체 글 감시")
@@ -528,6 +666,55 @@ def run(cfg: Config) -> int:
     streams = state.setdefault("streams", {})
     stream = streams.get(stream_key)
 
+    def notify(posts: List[Dict[str, Any]], *, is_test: bool) -> None:
+        """
+        Slack + KakaoTalk(설정된 경우)로 동시에 전송합니다.
+        """
+        slack_text = build_slack_summary_text(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test)
+        kakao_text = build_kakao_summary_text(
+            posts=posts,
+            feed_name=cfg.alert_feed_name.replace("*", ""),
+            emoji=cfg.alert_emoji,
+            max_chars=cfg.kakao_max_chars,
+        )
+
+        if cfg.dry_run:
+            print(slack_text)
+            if _kakao_enabled(cfg.kakao_rest_api_key, cfg.kakao_refresh_token):
+                print("\n--- Kakao preview ---")
+                print(kakao_text)
+            return
+
+        sent_any = False
+
+        if cfg.slack_webhook_url:
+            send_slack_message(
+                session,
+                webhook_url=str(cfg.slack_webhook_url),
+                text=slack_text,
+                channel=cfg.slack_channel,
+                username=cfg.slack_username,
+            )
+            sent_any = True
+        else:
+            print("[WARN] SLACK_WEBHOOK_URL이 없어 Slack 전송을 건너뜁니다.", file=sys.stderr)
+
+        if _kakao_enabled(cfg.kakao_rest_api_key, cfg.kakao_refresh_token):
+            access = kakao_refresh_access_token(
+                session,
+                rest_api_key=str(cfg.kakao_rest_api_key),
+                refresh_token=str(cfg.kakao_refresh_token),
+            )
+            first_link = str(posts[0].get("link", "")).strip() or cfg.wp_base_url
+            send_kakao_to_me(session, access_token=access, text=kakao_text, link=first_link)
+            sent_any = True
+        else:
+            # Kakao 설정이 없으면 조용히 스킵 (Slack-only 운영을 허용)
+            pass
+
+        if not sent_any:
+            raise SystemExit("전송할 채널(Slack/Kakao)이 설정되지 않았습니다.")
+
     # 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송
     if cfg.test_latest:
         latest = fetch_latest_post(session, base_url=cfg.wp_base_url, category_ids=category_ids)
@@ -536,29 +723,18 @@ def run(cfg: Config) -> int:
             if cfg.dry_run:
                 print(text)
                 return 0
-            _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-            send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
+            if cfg.slack_webhook_url:
+                send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
+            if _kakao_enabled(cfg.kakao_rest_api_key, cfg.kakao_refresh_token):
+                access = kakao_refresh_access_token(
+                    session,
+                    rest_api_key=str(cfg.kakao_rest_api_key),
+                    refresh_token=str(cfg.kakao_refresh_token),
+                )
+                send_kakao_to_me(session, access_token=access, text=text, link=cfg.wp_base_url)
             return 0
 
-        text = build_slack_summary_text(
-            posts=[latest],
-            feed_name=cfg.alert_feed_name,
-            emoji=cfg.alert_emoji,
-            is_test=True,
-        )
-
-        if cfg.dry_run:
-            print(text)
-            return 0
-
-        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-        send_slack_message(
-            session,
-            webhook_url=str(cfg.slack_webhook_url),
-            text=text,
-            channel=cfg.slack_channel,
-            username=cfg.slack_username,
-        )
+        notify([latest], is_test=True)
         return 0
 
     # init 모드: 항상 최신 글 기준점으로 저장
@@ -624,28 +800,7 @@ def run(cfg: Config) -> int:
             save_state(cfg.state_path, state)
             return 0
 
-        if not cfg.dry_run:
-            _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-
-        for p in posts:
-            pass  # (기존 개별 전송 로직 제거: 아래에서 1개 메시지로 요약 전송)
-
-        text = build_slack_summary_text(
-            posts=posts,
-            feed_name=cfg.alert_feed_name,
-            emoji=cfg.alert_emoji,
-            is_test=False,
-        )
-        if cfg.dry_run:
-            print(text)
-        else:
-            send_slack_message(
-                session,
-                webhook_url=str(cfg.slack_webhook_url),
-                text=text,
-                channel=cfg.slack_channel,
-                username=cfg.slack_username,
-            )
+        notify(posts, is_test=False)
 
         last = posts[-1]
         last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())
@@ -678,25 +833,7 @@ def run(cfg: Config) -> int:
         # 상태 갱신(선택): last_checked를 남기고 싶으면 여기에 추가 가능
         return 0
 
-    if not cfg.dry_run:
-        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-
-    text = build_slack_summary_text(
-        posts=posts,
-        feed_name=cfg.alert_feed_name,
-        emoji=cfg.alert_emoji,
-        is_test=False,
-    )
-    if cfg.dry_run:
-        print(text)
-    else:
-        send_slack_message(
-            session,
-            webhook_url=str(cfg.slack_webhook_url),
-            text=text,
-            channel=cfg.slack_channel,
-            username=cfg.slack_username,
-        )
+    notify(posts, is_test=False)
 
     last = posts[-1]
     last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())
