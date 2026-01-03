@@ -142,6 +142,14 @@ GitHub Actions cache는 **best-effort**라서, 드물게 만료/정리되면 `st
 - 기본 동작(`SEND_ON_FIRST_RUN=false`): 상태가 없으면 **기준점만 저장하고 알림은 보내지 않음(스팸 방지)**
 - 필요하면 `SEND_ON_FIRST_RUN=true`로 바꿔서 “상태 초기화 시 최근 글도 전송”하도록 할 수 있지만 스팸 위험이 있습니다.
 
+### 4) 수동 실행에서 “최신 글 1건 [TEST] 전송” 옵션
+워크플로우는 수동 실행 시 입력값으로 아래 옵션을 제공합니다.
+
+- `ping=true`: Slack 연결 테스트 메시지 1건 전송
+- `test_post=true`: **사이트 전체 posts 기준 최신 글 1건을 `[TEST]`로 전송**
+
+새 글이 없을 때도 end-to-end로 “WordPress API 조회 → Slack 전송”을 확인할 때 유용합니다.
+
 ---
 
 ## 트러블슈팅
