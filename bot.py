@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+from email.utils import format_datetime
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -103,75 +104,63 @@ def _format_dt_z(dt: datetime) -> str:
     return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _format_post_time_labels(date_gmt: str) -> str:
+def _slack_escape(text: str) -> str:
     """
-    Slack에 표시할 시간 라벨을 만듭니다.
-    - WordPress API의 date_gmt(UTC)를 기준으로
-    - 가능하면 KST(Asia/Seoul)도 같이 표기합니다.
+    Slack mrkdwn에서 링크 텍스트로 쓸 때 깨질 수 있는 문자들을 최소한으로 이스케이프합니다.
+    """
+    t = text or ""
+    t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    t = t.replace("|", "｜")  # 링크 텍스트 구분자 충돌 방지
+    return t
+
+
+def _format_rfc2822_utc(date_gmt: str) -> str:
+    """
+    예: Fri, 02 Jan 2026 11:00:58 +0000
+    - 사용자 요청 포맷에 맞춰 RFC 2822(=RSS pubDate 느낌)로 표기합니다.
     """
     dt_utc = _parse_wp_date_gmt(date_gmt)
-    utc_label = dt_utc.replace(microsecond=0).strftime("%Y-%m-%d %H:%M UTC")
-
-    try:
-        # zoneinfo는 Python 3.9+ 표준 라이브러리입니다.
-        from zoneinfo import ZoneInfo  # type: ignore
-
-        dt_kst = dt_utc.astimezone(ZoneInfo("Asia/Seoul"))
-        kst_label = dt_kst.replace(microsecond=0).strftime("%Y-%m-%d %H:%M KST")
-        return f"{kst_label} ({utc_label})"
-    except Exception:
-        return utc_label
+    dt_utc = dt_utc.replace(microsecond=0).astimezone(timezone.utc)
+    return format_datetime(dt_utc, usegmt=False)
 
 
-def build_slack_blocks_for_post(
+def build_slack_summary_text(
     *,
-    title: str,
-    link: str,
-    date_gmt: str,
-    post_id: int,
+    posts: List[Dict[str, Any]],
+    feed_name: str,
+    emoji: str,
     is_test: bool,
-) -> List[Dict[str, Any]]:
+) -> str:
     """
-    Slack Block Kit 기반으로 보기 좋은 메시지 블록을 생성합니다.
+    요청하신 텍스트 포맷으로 1개의 메시지에 N개 글을 요약합니다.
+
+    예:
+      :신문: 협동과정 인공지능 전공 새 글 1개
+      - 제목  (Fri, 02 Jan 2026 11:00:58 +0000)
     """
-    header = "[TEST] SNU Architecture 새 글 알림" if is_test else "SNU Architecture 새 글 알림"
-    time_label = _format_post_time_labels(date_gmt)
-    safe_title = title or "(제목 없음)"
+    count = len(posts)
+    test_prefix = "[TEST] " if is_test else ""
+    header = f"{emoji} {test_prefix}{feed_name} 새 글 {count}개"
 
-    blocks: List[Dict[str, Any]] = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": header},
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*<{link}|{safe_title}>*"},
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "게시글 열기"},
-                    "url": link,
-                }
-            ],
-        },
-        {
-            "type": "context",
-            "elements": [
-                {"type": "mrkdwn", "text": f"게시일: `{time_label}`"},
-                {"type": "mrkdwn", "text": f"ID: `{post_id}`"},
-            ],
-        },
-    ]
-    return blocks
+    lines = [header]
+    for p in posts:
+        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        link = str(p.get("link", "")).strip()
+        date_gmt = str(p.get("date_gmt", "")).strip()
 
+        safe_title = _slack_escape(title or "(제목 없음)")
+        safe_link = link
 
-def build_slack_text_fallback(*, title: str, link: str, is_test: bool) -> str:
-    prefix = "[TEST] " if is_test else ""
-    safe_title = title or "(제목 없음)"
-    return f"{prefix}새 글: {safe_title}\n{link}"
+        # 제목은 URL을 노출하지 않고 클릭 가능하게 만듭니다.
+        title_md = f"<{safe_link}|{safe_title}>" if safe_link else safe_title
+        date_str = _format_rfc2822_utc(date_gmt) if date_gmt else ""
+
+        if date_str:
+            lines.append(f"- {title_md}  ({date_str})")
+        else:
+            lines.append(f"- {title_md}")
+
+    return "\n".join(lines)
 
 
 def _requests_session() -> requests.Session:
@@ -341,7 +330,6 @@ def send_slack_message(
     *,
     webhook_url: str,
     text: str,
-    blocks: Optional[List[Dict[str, Any]]] = None,
     channel: Optional[str] = None,
     username: Optional[str] = None,
     timeout_sec: float = 15.0,
@@ -351,8 +339,6 @@ def send_slack_message(
         "unfurl_links": False,
         "unfurl_media": False,
     }
-    if blocks:
-        payload["blocks"] = blocks
     if channel:
         payload["channel"] = channel
     if username:
@@ -422,6 +408,9 @@ class Config:
     slack_channel: Optional[str]
     slack_username: Optional[str]
 
+    alert_feed_name: str
+    alert_emoji: str
+
     dry_run: bool
     init_only: bool
     test_latest: bool
@@ -457,6 +446,9 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
     slack_channel = args.slack_channel or os.getenv("SLACK_CHANNEL")
     slack_username = args.slack_username or os.getenv("SLACK_USERNAME")
 
+    alert_feed_name = os.getenv("ALERT_FEED_NAME") or "서울대 건축학과"
+    alert_emoji = os.getenv("ALERT_EMOJI") or ":newspaper:"
+
     return Config(
         wp_base_url=wp_base_url,
         wp_watch_all=wp_watch_all,
@@ -469,6 +461,8 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
         slack_username=slack_username,
+        alert_feed_name=alert_feed_name,
+        alert_emoji=alert_emoji,
         dry_run=bool(args.dry_run),
         init_only=bool(args.init),
         test_latest=bool(args.test_latest),
@@ -542,13 +536,12 @@ def run(cfg: Config) -> int:
             send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
             return 0
 
-        post_id = int(latest.get("id", 0))
-        title = _clean_text(str(latest.get("title", {}).get("rendered", "")))
-        link = str(latest.get("link", "")).strip()
-        date_gmt = str(latest.get("date_gmt", "")).strip()
-
-        blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=True)
-        text = build_slack_text_fallback(title=title, link=link, is_test=True)
+        text = build_slack_summary_text(
+            posts=[latest],
+            feed_name=cfg.alert_feed_name,
+            emoji=cfg.alert_emoji,
+            is_test=True,
+        )
 
         if cfg.dry_run:
             print(text)
@@ -559,7 +552,6 @@ def run(cfg: Config) -> int:
             session,
             webhook_url=str(cfg.slack_webhook_url),
             text=text,
-            blocks=blocks,
             channel=cfg.slack_channel,
             username=cfg.slack_username,
         )
@@ -632,24 +624,24 @@ def run(cfg: Config) -> int:
             _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
 
         for p in posts:
-            post_id = int(p.get("id", 0))
-            title = _clean_text(str(p.get("title", {}).get("rendered", "")))
-            link = str(p.get("link", "")).strip()
-            date_gmt = str(p.get("date_gmt", "")).strip()
-            blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=False)
-            text = build_slack_text_fallback(title=title, link=link, is_test=False)
-            if cfg.dry_run:
-                print(text)
-                print("-" * 60)
-            else:
-                send_slack_message(
-                    session,
-                    webhook_url=str(cfg.slack_webhook_url),
-                    text=text,
-                    blocks=blocks,
-                    channel=cfg.slack_channel,
-                    username=cfg.slack_username,
-                )
+            pass  # (기존 개별 전송 로직 제거: 아래에서 1개 메시지로 요약 전송)
+
+        text = build_slack_summary_text(
+            posts=posts,
+            feed_name=cfg.alert_feed_name,
+            emoji=cfg.alert_emoji,
+            is_test=False,
+        )
+        if cfg.dry_run:
+            print(text)
+        else:
+            send_slack_message(
+                session,
+                webhook_url=str(cfg.slack_webhook_url),
+                text=text,
+                channel=cfg.slack_channel,
+                username=cfg.slack_username,
+            )
 
         last = posts[-1]
         last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())
@@ -685,25 +677,22 @@ def run(cfg: Config) -> int:
     if not cfg.dry_run:
         _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
 
-    for p in posts:
-        post_id = int(p.get("id", 0))
-        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
-        link = str(p.get("link", "")).strip()
-        date_gmt = str(p.get("date_gmt", "")).strip()
-        blocks = build_slack_blocks_for_post(title=title, link=link, date_gmt=date_gmt, post_id=post_id, is_test=False)
-        text = build_slack_text_fallback(title=title, link=link, is_test=False)
-        if cfg.dry_run:
-            print(text)
-            print("-" * 60)
-        else:
-            send_slack_message(
-                session,
-                webhook_url=str(cfg.slack_webhook_url),
-                text=text,
-                blocks=blocks,
-                channel=cfg.slack_channel,
-                username=cfg.slack_username,
-            )
+    text = build_slack_summary_text(
+        posts=posts,
+        feed_name=cfg.alert_feed_name,
+        emoji=cfg.alert_emoji,
+        is_test=False,
+    )
+    if cfg.dry_run:
+        print(text)
+    else:
+        send_slack_message(
+            session,
+            webhook_url=str(cfg.slack_webhook_url),
+            text=text,
+            channel=cfg.slack_channel,
+            username=cfg.slack_username,
+        )
 
     last = posts[-1]
     last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())

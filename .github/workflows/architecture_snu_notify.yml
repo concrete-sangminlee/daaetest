@@ -79,6 +79,8 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           WP_WATCH_ALL: "true"
+          ALERT_EMOJI: ":신문:"
+          ALERT_FEED_NAME: "서울대 건축학과"
           STATE_PATH: "./state.json"
           WP_PER_PAGE: "50"
           MAX_NOTIFY_PER_RUN: "20"
