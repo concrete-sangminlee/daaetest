@@ -33,6 +33,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
+try:
+    from notion_client import Client
+except ImportError:
+    Client = None  # type: ignore[assignment, misc]
+
 
 WP_POSTS_PATH = "/wp-json/wp/v2/posts"
 WP_CATEGORIES_PATH = "/wp-json/wp/v2/categories"
@@ -353,6 +358,128 @@ def send_slack_message(
         raise RuntimeError(f"Slack webhook 실패: HTTP {resp.status_code} / body={resp.text[:300]!r}")
 
 
+def _normalize_notion_page_id(page_id_or_url: str) -> str:
+    """
+    Notion 페이지 ID를 정규화합니다.
+    URL 형식: https://www.notion.so/Notice-27e2cbf5657380319715fa24fb5d4d15
+    -> 페이지 ID: 27e2cbf5657380319715fa24fb5d4d15 (하이픈 제거)
+    """
+    s = (page_id_or_url or "").strip()
+    if not s:
+        return ""
+    
+    # URL에서 페이지 ID 추출
+    if "notion.so" in s:
+        # 마지막 하이픈 이후 부분이 페이지 ID
+        parts = s.split("-")
+        if parts:
+            page_id = parts[-1]
+            # 32자 hex 문자열인지 확인
+            if len(page_id) == 32 and all(c in "0123456789abcdef" for c in page_id.lower()):
+                return page_id
+    
+    # 이미 페이지 ID인 경우 (하이픈 제거)
+    s = s.replace("-", "")
+    if len(s) == 32 and all(c in "0123456789abcdef" for c in s.lower()):
+        return s
+    
+    return s
+
+
+def send_to_notion(
+    *,
+    token: str,
+    page_id: str,
+    posts: List[Dict[str, Any]],
+    feed_name: str,
+    emoji: str,
+    is_test: bool,
+    dry_run: bool = False,
+) -> None:
+    """
+    Notion 페이지에 새 글 목록을 블록으로 추가합니다.
+    """
+    if Client is None:
+        raise RuntimeError("notion-client 라이브러리가 설치되지 않았습니다. pip install notion-client")
+
+    if dry_run:
+        print(f"[DRY-RUN] Notion 전송: {len(posts)}개 글")
+        return
+
+    normalized_page_id = _normalize_notion_page_id(page_id)
+    if not normalized_page_id:
+        raise ValueError(f"유효하지 않은 Notion 페이지 ID: {page_id}")
+
+    client = Client(auth=token)
+
+    # 각 글을 Notion 블록으로 추가
+    blocks: List[Dict[str, Any]] = []
+    
+    # 헤더 블록
+    header_text = f"{emoji} {feed_name} 새 글 {len(posts)}개"
+    if is_test:
+        header_text = f"[TEST] {header_text}"
+    
+    blocks.append({
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": header_text}}]
+        }
+    })
+
+    # 각 글을 bulleted_list_item으로 추가
+    for p in posts:
+        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        link = str(p.get("link", "")).strip()
+        date_gmt = str(p.get("date_gmt", "")).strip()
+        
+        if not title:
+            title = "(제목 없음)"
+        
+        # 날짜 포맷팅
+        date_str = ""
+        if date_gmt:
+            try:
+                date_str = _format_rfc2822_utc(date_gmt)
+            except Exception:
+                date_str = date_gmt
+        
+        # 링크가 있으면 링크 텍스트로, 없으면 일반 텍스트로
+        if link:
+            item_text = f"{title} ({date_str})" if date_str else title
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": item_text,
+                                "link": {"url": link}
+                            }
+                        }
+                    ]
+                }
+            })
+        else:
+            item_text = f"{title} ({date_str})" if date_str else title
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {
+                    "rich_text": [{"type": "text", "text": {"content": item_text}}]
+                }
+            })
+
+    # Notion API로 블록 추가 (한 번에 최대 100개까지 가능)
+    try:
+        client.blocks.children.append(block_id=normalized_page_id, children=blocks)
+    except Exception as e:
+        raise RuntimeError(f"Notion API 실패: {e}") from e
+
+
 def fetch_latest_post(
     session: requests.Session,
     *,
@@ -412,6 +539,9 @@ class Config:
     slack_channel: Optional[str]
     slack_username: Optional[str]
 
+    notion_token: Optional[str]
+    notion_page_id: Optional[str]
+
     alert_feed_name: str
     alert_emoji: str
 
@@ -450,6 +580,9 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
     slack_channel = args.slack_channel or os.getenv("SLACK_CHANNEL")
     slack_username = args.slack_username or os.getenv("SLACK_USERNAME")
 
+    notion_token = os.getenv("NOTION_TOKEN")
+    notion_page_id = os.getenv("NOTION_PAGE_ID")
+
     alert_feed_name = os.getenv("ALERT_FEED_NAME") or "건축학과"
     alert_emoji = os.getenv("ALERT_EMOJI") or "📰"
 
@@ -465,6 +598,8 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         slack_webhook_url=slack_webhook_url,
         slack_channel=slack_channel,
         slack_username=slack_username,
+        notion_token=notion_token,
+        notion_page_id=notion_page_id,
         alert_feed_name=alert_feed_name,
         alert_emoji=alert_emoji,
         dry_run=bool(args.dry_run),
@@ -530,22 +665,37 @@ def run(cfg: Config) -> int:
 
     def notify(posts: List[Dict[str, Any]], *, is_test: bool) -> None:
         """
-        Slack으로 전송합니다.
+        Slack과 Notion으로 전송합니다.
         """
         slack_text = build_slack_summary_text(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test)
 
         if cfg.dry_run:
             print(slack_text)
+            if cfg.notion_token and cfg.notion_page_id:
+                print(f"[DRY-RUN] Notion 전송: {len(posts)}개 글")
             return
 
-        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-        send_slack_message(
-            session,
-            webhook_url=str(cfg.slack_webhook_url),
-            text=slack_text,
-            channel=cfg.slack_channel,
-            username=cfg.slack_username,
-        )
+        # Slack 전송
+        if cfg.slack_webhook_url:
+            send_slack_message(
+                session,
+                webhook_url=str(cfg.slack_webhook_url),
+                text=slack_text,
+                channel=cfg.slack_channel,
+                username=cfg.slack_username,
+            )
+
+        # Notion 전송
+        if cfg.notion_token and cfg.notion_page_id:
+            send_to_notion(
+                token=str(cfg.notion_token),
+                page_id=str(cfg.notion_page_id),
+                posts=posts,
+                feed_name=cfg.alert_feed_name,
+                emoji=cfg.alert_emoji,
+                is_test=is_test,
+                dry_run=cfg.dry_run,
+            )
 
     # 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송
     if cfg.test_latest:
