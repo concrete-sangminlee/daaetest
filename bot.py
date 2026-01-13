@@ -428,8 +428,15 @@ def send_to_notion(
         }
     })
 
-    # 각 글을 bulleted_list_item으로 추가
-    for p in posts:
+    # 구분선 추가
+    blocks.append({
+        "object": "block",
+        "type": "divider",
+        "divider": {}
+    })
+
+    # 각 글을 callout 블록으로 추가 (더 예쁘게 표시)
+    for idx, p in enumerate(posts):
         title = _clean_text(str(p.get("title", {}).get("rendered", "")))
         link = str(p.get("link", "")).strip()
         date_gmt = str(p.get("date_gmt", "")).strip()
@@ -437,40 +444,69 @@ def send_to_notion(
         if not title:
             title = "(제목 없음)"
         
-        # 날짜 포맷팅
+        # 날짜 포맷팅 (간단하게)
         date_str = ""
         if date_gmt:
             try:
-                date_str = _format_rfc2822_utc(date_gmt)
+                dt = _parse_wp_date_gmt(date_gmt)
+                # YYYY-MM-DD HH:MM 형식으로 표시
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
             except Exception:
-                date_str = date_gmt
+                date_str = date_gmt[:16] if len(date_gmt) >= 16 else date_gmt
         
-        # 링크가 있으면 링크 텍스트로, 없으면 일반 텍스트로
-        if link:
-            item_text = f"{title} ({date_str})" if date_str else title
-            blocks.append({
-                "object": "block",
-                "type": "bulleted_list_item",
-                "bulleted_list_item": {
-                    "rich_text": [
-                        {
-                            "type": "text",
-                            "text": {
-                                "content": item_text,
-                                "link": {"url": link}
-                            }
-                        }
-                    ]
-                }
+        # Callout 블록의 rich_text 구성
+        rich_text_parts: List[Dict[str, Any]] = []
+        
+        # 제목 (bold)
+        rich_text_parts.append({
+            "type": "text",
+            "text": {"content": title},
+            "annotations": {"bold": True}
+        })
+        
+        # 날짜가 있으면 추가
+        if date_str:
+            rich_text_parts.append({
+                "type": "text",
+                "text": {"content": f"\n📅 {date_str}"},
+                "annotations": {"bold": False}
             })
-        else:
-            item_text = f"{title} ({date_str})" if date_str else title
+        
+        # 링크가 있으면 별도 줄로 추가
+        if link:
+            rich_text_parts.append({
+                "type": "text",
+                "text": {"content": "\n🔗 "},
+                "annotations": {"bold": False}
+            })
+            rich_text_parts.append({
+                "type": "text",
+                "text": {
+                    "content": "원문 보기",
+                    "link": {"url": link}
+                },
+                "annotations": {"bold": False}
+            })
+        
+        # Callout 블록 생성 (색상: blue)
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": rich_text_parts,
+                "icon": {
+                    "emoji": "📰"
+                },
+                "color": "blue"
+            }
+        })
+        
+        # 마지막 글이 아니면 구분선 추가 (선택적)
+        if idx < len(posts) - 1:
             blocks.append({
                 "object": "block",
-                "type": "bulleted_list_item",
-                "bulleted_list_item": {
-                    "rich_text": [{"type": "text", "text": {"content": item_text}}]
-                }
+                "type": "divider",
+                "divider": {}
             })
 
     # Notion API로 블록 추가 (한 번에 최대 100개까지 가능)
