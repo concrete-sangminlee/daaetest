@@ -69,6 +69,8 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_post == 'true' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           ALERT_EMOJI: "📰"
           ALERT_FEED_NAME: "건축학과"
@@ -79,6 +81,8 @@ jobs:
       - name: Run notifier
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
           WP_BASE_URL: "https://architecture.snu.ac.kr"
           WP_WATCH_ALL: "true"
           ALERT_EMOJI: "📰"

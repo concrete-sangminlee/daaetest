@@ -476,8 +476,13 @@ def send_to_notion(
     # Notion API로 블록 추가 (한 번에 최대 100개까지 가능)
     try:
         client.blocks.children.append(block_id=normalized_page_id, children=blocks)
+        print(f"[OK] Notion 전송 완료: {len(posts)}개 글을 페이지에 추가했습니다.")
     except Exception as e:
-        raise RuntimeError(f"Notion API 실패: {e}") from e
+        error_msg = str(e)
+        print(f"[ERROR] Notion API 실패: {error_msg}", file=sys.stderr)
+        # Notion 실패해도 Slack은 이미 전송했으므로 전체 프로세스를 중단하지 않음
+        # 대신 에러를 로그로 남기고 계속 진행
+        raise RuntimeError(f"Notion API 실패: {error_msg}") from e
 
 
 def fetch_latest_post(
@@ -687,15 +692,22 @@ def run(cfg: Config) -> int:
 
         # Notion 전송
         if cfg.notion_token and cfg.notion_page_id:
-            send_to_notion(
-                token=str(cfg.notion_token),
-                page_id=str(cfg.notion_page_id),
-                posts=posts,
-                feed_name=cfg.alert_feed_name,
-                emoji=cfg.alert_emoji,
-                is_test=is_test,
-                dry_run=cfg.dry_run,
-            )
+            try:
+                send_to_notion(
+                    token=str(cfg.notion_token),
+                    page_id=str(cfg.notion_page_id),
+                    posts=posts,
+                    feed_name=cfg.alert_feed_name,
+                    emoji=cfg.alert_emoji,
+                    is_test=is_test,
+                    dry_run=cfg.dry_run,
+                )
+            except Exception as e:
+                # Notion 실패해도 Slack은 이미 전송했으므로 경고만 출력하고 계속 진행
+                print(f"[WARN] Notion 전송 실패 (Slack은 정상 전송됨): {e}", file=sys.stderr)
+        elif cfg.notion_token or cfg.notion_page_id:
+            # 둘 중 하나만 설정된 경우 경고
+            print(f"[WARN] Notion 전송 스킵: NOTION_TOKEN과 NOTION_PAGE_ID 둘 다 설정되어야 합니다.", file=sys.stderr)
 
     # 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송
     if cfg.test_latest:
