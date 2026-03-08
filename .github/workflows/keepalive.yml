@@ -1,0 +1,24 @@
+name: Keepalive — prevent scheduled workflows from being disabled
+
+on:
+  schedule:
+    # 매월 1일 00:00 UTC에 실행 (60일 비활성 방지)
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Keepalive — dummy commit if inactive
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          time_elapsed: 45
