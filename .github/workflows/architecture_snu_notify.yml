@@ -57,13 +57,12 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.ping == 'true' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          WP_BASE_URL: "https://architecture.snu.ac.kr"
+          ALERT_FEED_NAME: "건축학과"
+          ALERT_EMOJI: "📢"
         run: |
           set -euo pipefail
-          curl -sS -X POST \
-            -H 'Content-type: application/json' \
-            --data '{"text":"[daaetest] GitHub Actions 수동 실행 ping: Slack 전송 OK (site=architecture.snu.ac.kr)"}' \
-            "$SLACK_WEBHOOK_URL" \
-            | head -c 200
+          python bot.py --ping
 
       - name: Send latest post (TEST, manual run only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_post == 'true' }}

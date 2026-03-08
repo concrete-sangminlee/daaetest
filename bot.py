@@ -129,6 +129,18 @@ def _format_rfc2822_utc(date_gmt: str) -> str:
     return format_datetime(dt_utc, usegmt=False)
 
 
+_KST = timezone(timedelta(hours=9))
+_WEEKDAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def _format_date_kst(date_gmt: str) -> str:
+    """KST 한국어 날짜 포맷. 예: 2026. 1. 2. (금) 20:00"""
+    dt = _parse_wp_date_gmt(date_gmt)
+    dt_kst = dt.astimezone(_KST)
+    weekday = _WEEKDAYS_KO[dt_kst.weekday()]
+    return f"{dt_kst.year}. {dt_kst.month}. {dt_kst.day}. ({weekday}) {dt_kst.strftime('%H:%M')}"
+
+
 def build_slack_summary_text(
     *,
     posts: List[Dict[str, Any]],
@@ -170,6 +182,116 @@ def build_slack_summary_text(
             lines.append(f"- {title_md}")
 
     return "\n".join(lines)
+
+
+def build_slack_attachments(
+    *,
+    posts: List[Dict[str, Any]],
+    feed_name: str,
+    emoji: str,
+    is_test: bool,
+    base_url: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Slack Attachment + Block Kit으로 프리미엄 알림 메시지를 구성합니다.
+    네이비 컬러바(#003876) + 인용 스타일 제목 + Primary 버튼 + 브랜딩 푸터.
+    """
+    count = len(posts)
+
+    header = f"{emoji}  *{feed_name} 새 공지사항*"
+    if is_test:
+        header = f"[TEST]  {header}"
+    subtitle = f"서울대학교 {feed_name}  ｜  🔔 {count}건의 새로운 공지사항"
+
+    blocks: List[Dict[str, Any]] = []
+
+    # ── Header + Subtitle ──
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": f"{header}\n{subtitle}"},
+    })
+    blocks.append({"type": "divider"})
+
+    # ── Posts (인용 스타일 + Primary 버튼) ──
+    for idx, p in enumerate(posts):
+        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        link = str(p.get("link", "")).strip()
+
+        safe_title = _slack_escape(title or "(제목 없음)")
+
+        if link:
+            title_text = f"> *<{link}|{safe_title}>*"
+        else:
+            title_text = f"> *{safe_title}*"
+
+        section: Dict[str, Any] = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": title_text},
+        }
+
+        if link:
+            section["accessory"] = {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "확인하기", "emoji": True},
+                "url": link,
+                "style": "primary",
+                "action_id": f"open_post_{idx}",
+            }
+
+        blocks.append(section)
+
+    blocks.append({"type": "divider"})
+
+    # ── 전체 공지사항 보기 버튼 ──
+    if base_url:
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "text": {"type": "plain_text", "text": "📋  전체 공지사항 보기", "emoji": True},
+                "url": base_url,
+                "action_id": "view_all_posts",
+            }],
+        })
+
+    # ── 브랜딩 푸터 ──
+    now_kst = datetime.now(_KST)
+    ts = f"{now_kst.year}. {now_kst.month:02d}. {now_kst.day:02d}  {now_kst.strftime('%H:%M')} KST"
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": f"🏫 {feed_name} Notice Bot  ｜  {ts}"}],
+    })
+
+    return [{"color": "#003876", "blocks": blocks}]
+
+
+def build_ping_attachments(*, feed_name: str, base_url: str = "") -> List[Dict[str, Any]]:
+    """
+    Slack 연결 확인용 ping 메시지. 그린 컬러바(#2eb67d).
+    """
+    now_kst = datetime.now(_KST)
+    ts = f"{now_kst.year}. {now_kst.month:02d}. {now_kst.day:02d}  {now_kst.strftime('%H:%M')} KST"
+
+    site_domain = (
+        base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        if base_url else ""
+    )
+    status_line = f"✅  *연결 상태 정상*\n{feed_name} 알림 봇이 정상적으로 작동 중입니다."
+    if site_domain:
+        status_line += f"\n🔗  대상 사이트: {site_domain}"
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": status_line},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"🏫 {feed_name} Notice Bot  ｜  {ts}"}],
+        },
+    ]
+
+    return [{"color": "#2eb67d", "blocks": blocks}]
 
 
 def _requests_session() -> requests.Session:
@@ -339,6 +461,7 @@ def send_slack_message(
     *,
     webhook_url: str,
     text: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
     channel: Optional[str] = None,
     username: Optional[str] = None,
     timeout_sec: float = 15.0,
@@ -348,6 +471,8 @@ def send_slack_message(
         "unfurl_links": False,
         "unfurl_media": False,
     }
+    if attachments:
+        payload["attachments"] = attachments
     if channel:
         payload["channel"] = channel
     if username:
@@ -589,6 +714,7 @@ class Config:
     dry_run: bool
     init_only: bool
     test_latest: bool
+    ping: bool
 
 
 def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
@@ -646,6 +772,7 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         dry_run=bool(args.dry_run),
         init_only=bool(args.init),
         test_latest=bool(args.test_latest),
+        ping=bool(args.ping),
     )
 
 
@@ -654,6 +781,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--init", action="store_true", help="최신 글을 기준점으로 저장만 하고 종료(초기화)")
     p.add_argument("--dry-run", action="store_true", help="Slack 전송 없이 콘솔에만 출력")
     p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 테스트 전송(상태 저장 없음)")
+    p.add_argument("--ping", action="store_true", help="Slack 연결 테스트 메시지 전송")
 
     p.add_argument("--wp-base-url", default=None, help="기본: https://architecture.snu.ac.kr")
     p.add_argument("--watch-all", action="store_true", default=None, help="카테고리 필터 없이 전체 글 감시")
@@ -686,6 +814,25 @@ def _require(cond: bool, msg: str) -> None:
 def run(cfg: Config) -> int:
     session = _requests_session()
 
+    # Ping 모드
+    if cfg.ping:
+        text = f"[PING] {cfg.alert_feed_name} 알림 봇 연결 테스트"
+        attachments = build_ping_attachments(feed_name=cfg.alert_feed_name, base_url=cfg.wp_base_url)
+        if cfg.dry_run:
+            print(text)
+            return 0
+        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다.")
+        send_slack_message(
+            session,
+            webhook_url=str(cfg.slack_webhook_url),
+            text=text,
+            attachments=attachments,
+            channel=cfg.slack_channel,
+            username=cfg.slack_username,
+        )
+        print("[OK] Ping 전송 완료")
+        return 0
+
     # 카테고리 해석
     category_ids: List[int] = []
     if not cfg.wp_watch_all:
@@ -709,6 +856,7 @@ def run(cfg: Config) -> int:
         Slack과 Notion으로 전송합니다.
         """
         slack_text = build_slack_summary_text(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test)
+        slack_attachments = build_slack_attachments(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test, base_url=cfg.wp_base_url)
 
         if cfg.dry_run:
             print(slack_text)
@@ -722,6 +870,7 @@ def run(cfg: Config) -> int:
                 session,
                 webhook_url=str(cfg.slack_webhook_url),
                 text=slack_text,
+                attachments=slack_attachments,
                 channel=cfg.slack_channel,
                 username=cfg.slack_username,
             )
