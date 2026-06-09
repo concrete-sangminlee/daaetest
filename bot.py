@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-architecture.snu.ac.kr 새 글을 감지해 Slack으로 알림을 보내는 폴링(polling) 스크립트입니다.
+architecture.snu.ac.kr (SNU DAAE) 새 공지를 감지해 Slack/Notion으로 알림을 보내는 폴링 스크립트입니다.
 
-핵심 아이디어
-- 대상 사이트가 WordPress이므로, HTML 스크래핑 대신 WordPress REST API(/wp-json/wp/v2/posts)를 사용합니다.
-- 마지막으로 알림 보낸 지점을 state.json에 (date_gmt, id) 커서(cursor)로 저장해 중복 알림을 방지합니다.
-- 크론(cron)이나 스케줄러(GitHub Actions 등)로 주기 실행하면 "새 글 올라오면 알림"처럼 동작합니다.
+2026년 사이트 개편 안내
+- 기존 사이트는 WordPress였고 이 봇은 WordPress REST API(/wp-json/wp/v2/posts)를 사용했습니다.
+- 사이트가 SPA(Single Page App)로 전면 재구축되면서 /wp-json API가 사라졌고,
+  새 공지 데이터는 아래 JSON API로 제공됩니다.
+      POST https://architecture.snu.ac.kr/rest/activities/getNotices
+      body: {"page": 1}
+      resp: {"err": 0, "list": [{"id", "category", "ctype", "title", "post_date"}, ...]}
+  글 링크는 https://architecture.snu.ac.kr/post/{id} 형식입니다.
+- post_date는 'YYYY.MM.DD'(날짜만, 시간 없음)이고 id는 날짜순으로 단조증가하지 않으므로,
+  중복 알림 방지는 "이미 본 글 id 집합(seen_ids)"으로 처리합니다.
 
 실행 예시
-  1) 최초 기준점만 저장(스팸 방지)
-     python3 bot.py --init
-  2) 평상시 실행(새 글 있으면 Slack 전송)
-     python3 bot.py
-  3) Slack 전송 없이 출력만(dry-run)
-     python3 bot.py --dry-run
+  1) 최초 기준점만 저장(스팸 방지): python3 bot.py --init
+  2) 평상시 실행(새 글 있으면 전송): python3 bot.py
+  3) 전송 없이 출력만(dry-run):     python3 bot.py --dry-run
+  4) 최신 글 1건 테스트 전송:        python3 bot.py --test-latest
+  5) Slack 연결 확인:               python3 bot.py --ping
 """
 
 from __future__ import annotations
@@ -24,13 +29,14 @@ import json
 import os
 import re
 import sys
-from email.utils import format_datetime
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 try:
@@ -39,8 +45,13 @@ except ImportError:
     Client = None  # type: ignore[assignment, misc]
 
 
-WP_POSTS_PATH = "/wp-json/wp/v2/posts"
-WP_CATEGORIES_PATH = "/wp-json/wp/v2/categories"
+# 새 SPA 사이트의 공지 API. 같은 origin의 상대경로로 호출됩니다.
+NOTICES_PATH = "/rest/activities/getNotices"
+# 글 상세 페이지(SPA 클라이언트 라우트). 링크 생성에 사용합니다.
+POST_PATH = "/post"
+
+# seen_ids가 무한정 커지지 않도록 보관 상한(가장 큰 id 기준 최신 N개만 유지).
+MAX_SEEN_IDS = 2000
 
 
 def _parse_bool(value: Optional[str], *, default: bool = False) -> bool:
@@ -54,27 +65,8 @@ def _parse_bool(value: Optional[str], *, default: bool = False) -> bool:
     return default
 
 
-def _parse_csv_str(value: Optional[str]) -> List[str]:
-    if not value:
-        return []
-    parts = [p.strip() for p in value.split(",")]
-    return [p for p in parts if p]
-
-
-def _parse_csv_int(value: Optional[str]) -> List[int]:
-    out: List[int] = []
-    for p in _parse_csv_str(value):
-        try:
-            out.append(int(p))
-        except ValueError:
-            raise ValueError(f"정수로 파싱할 수 없는 값이 있습니다: {p!r}") from None
-    return out
-
-
 def _clean_text(text: str) -> str:
-    """
-    WordPress title.rendered는 HTML일 수 있어 Slack에 보기 좋게 정리합니다.
-    """
+    """제목에 HTML 엔티티/태그가 섞여 있을 수 있어 보기 좋게 정리합니다."""
     t = html.unescape(text or "")
     t = re.sub(r"<[^>]+>", "", t)  # 매우 단순한 tag strip
     t = re.sub(r"\s+", " ", t).strip()
@@ -85,60 +77,47 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_wp_date_gmt(date_gmt: str) -> datetime:
-    """
-    WordPress REST API의 date_gmt는 보통 'YYYY-MM-DDTHH:MM:SS' 형태(타임존 오프셋 없음)입니다.
-    이를 UTC aware datetime으로 변환합니다.
-    """
-    # date_gmt에 'Z'가 붙어올 수도 있어 둘 다 처리합니다.
-    s = (date_gmt or "").strip()
-    if not s:
-        raise ValueError("date_gmt가 비어 있습니다.")
-    if s.endswith("Z"):
-        s = s[:-1]
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
-
-
-def _format_dt_z(dt: datetime) -> str:
-    dt_utc = dt.astimezone(timezone.utc)
-    return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 def _slack_escape(text: str) -> str:
-    """
-    Slack mrkdwn에서 링크 텍스트로 쓸 때 깨질 수 있는 문자들을 최소한으로 이스케이프합니다.
-    """
+    """Slack mrkdwn 링크 텍스트에서 깨질 수 있는 문자들을 최소한으로 이스케이프합니다."""
     t = text or ""
     t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     t = t.replace("|", "｜")  # 링크 텍스트 구분자 충돌 방지
     return t
 
 
-def _format_rfc2822_utc(date_gmt: str) -> str:
-    """
-    예: Fri, 02 Jan 2026 11:00:58 +0000
-    - 사용자 요청 포맷에 맞춰 RFC 2822(=RSS pubDate 느낌)로 표기합니다.
-    """
-    dt_utc = _parse_wp_date_gmt(date_gmt)
-    dt_utc = dt_utc.replace(microsecond=0).astimezone(timezone.utc)
-    return format_datetime(dt_utc, usegmt=False)
+def _format_post_date(post_date: str) -> str:
+    """'2026.06.08' -> '2026. 6. 8.' (한국어 날짜 표기). 파싱 실패 시 원문 그대로."""
+    s = (post_date or "").strip()
+    m = re.match(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})", s)
+    if not m:
+        return s
+    y, mo, d = (int(g) for g in m.groups())
+    return f"{y}. {mo}. {d}."
 
 
 _KST = timezone(timedelta(hours=9))
-_WEEKDAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
-def _format_date_kst(date_gmt: str) -> str:
-    """KST 한국어 날짜 포맷. 예: 2026. 1. 2. (금) 20:00"""
-    dt = _parse_wp_date_gmt(date_gmt)
-    dt_kst = dt.astimezone(_KST)
-    weekday = _WEEKDAYS_KO[dt_kst.weekday()]
-    return f"{dt_kst.year}. {dt_kst.month}. {dt_kst.day}. ({weekday}) {dt_kst.strftime('%H:%M')}"
+# ──────────────────────────────────────────────────────────────────────────
+# 공지(post) 데이터 정규화
+# ──────────────────────────────────────────────────────────────────────────
+def _post_link(base_url: str, post_id: int) -> str:
+    return f"{base_url.rstrip('/')}{POST_PATH}/{post_id}"
+
+
+def normalize_notice(item: Dict[str, Any], *, base_url: str) -> Dict[str, Any]:
+    """
+    getNotices의 한 항목을 메시지 빌더가 쓰기 좋은 공통 형태로 변환합니다.
+    반환 키: id(int), title(str), link(str), post_date(str 'YYYY.MM.DD'), ctype(str)
+    """
+    pid = int(item.get("id", 0))
+    return {
+        "id": pid,
+        "title": _clean_text(str(item.get("title", ""))),
+        "link": _post_link(base_url, pid) if pid else "",
+        "post_date": str(item.get("post_date", "")).strip(),
+        "ctype": str(item.get("ctype", "")).strip(),
+    }
 
 
 def build_slack_summary_text(
@@ -149,32 +128,24 @@ def build_slack_summary_text(
     is_test: bool,
 ) -> str:
     """
-    요청하신 텍스트 포맷으로 1개의 메시지에 N개 글을 요약합니다.
-
-    예:
-      :신문: 협동과정 인공지능 전공 새 글 1개
-      - 제목  (Fri, 02 Jan 2026 11:00:58 +0000)
+    fallback / 알림 텍스트. 1개의 메시지에 N개 글을 요약합니다.
+      :신문: *건축학과* 새 글 1개
+      - 제목  (2026. 6. 8.)
     """
     count = len(posts)
-    # 사용자 요청: 헤더에 [TEST]는 표시하지 않음
-    # 사용자 요청: '건축학과'는 볼드 처리
-    display_name = (feed_name or "").strip()
-    display_name = _slack_escape(display_name)
+    display_name = _slack_escape((feed_name or "").strip())
     display_name = display_name.replace("건축학과", "*건축학과*")
     header = f"{emoji} {display_name} 새 글 {count}개"
 
     lines = [header]
     for p in posts:
-        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        title = _clean_text(str(p.get("title", "")))
         link = str(p.get("link", "")).strip()
-        date_gmt = str(p.get("date_gmt", "")).strip()
+        post_date = str(p.get("post_date", "")).strip()
 
         safe_title = _slack_escape(title or "(제목 없음)")
-        safe_link = link
-
-        # 제목은 URL을 노출하지 않고 클릭 가능하게 만듭니다.
-        title_md = f"<{safe_link}|{safe_title}>" if safe_link else safe_title
-        date_str = _format_rfc2822_utc(date_gmt) if date_gmt else ""
+        title_md = f"<{link}|{safe_title}>" if link else safe_title
+        date_str = _format_post_date(post_date)
 
         if date_str:
             lines.append(f"- {title_md}  ({date_str})")
@@ -214,8 +185,10 @@ def build_slack_attachments(
 
     # ── Posts (인용 스타일 + Primary 버튼) ──
     for idx, p in enumerate(posts):
-        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        title = _clean_text(str(p.get("title", "")))
         link = str(p.get("link", "")).strip()
+        post_date = str(p.get("post_date", "")).strip()
+        ctype = str(p.get("ctype", "")).strip()
 
         safe_title = _slack_escape(title or "(제목 없음)")
 
@@ -223,6 +196,16 @@ def build_slack_attachments(
             title_text = f"> *<{link}|{safe_title}>*"
         else:
             title_text = f"> *{safe_title}*"
+
+        # 분류/날짜 메타 라인
+        meta_bits = []
+        if ctype:
+            meta_bits.append(f"`{_slack_escape(ctype)}`")
+        date_str = _format_post_date(post_date)
+        if date_str:
+            meta_bits.append(f"📅 {date_str}")
+        if meta_bits:
+            title_text += "\n> " + "  ｜  ".join(meta_bits)
 
         section: Dict[str, Any] = {
             "type": "section",
@@ -249,7 +232,7 @@ def build_slack_attachments(
             "elements": [{
                 "type": "button",
                 "text": {"type": "plain_text", "text": "📋  전체 공지사항 보기", "emoji": True},
-                "url": base_url,
+                "url": base_url.rstrip("/") + "/posts/notice",
                 "action_id": "view_all_posts",
             }],
         })
@@ -266,9 +249,7 @@ def build_slack_attachments(
 
 
 def build_ping_attachments(*, feed_name: str, base_url: str = "") -> List[Dict[str, Any]]:
-    """
-    Slack 연결 확인용 ping 메시지. 그린 컬러바(#2eb67d).
-    """
+    """Slack 연결 확인용 ping 메시지. 그린 컬러바(#2eb67d)."""
     now_kst = datetime.now(_KST)
     ts = f"{now_kst.year}. {now_kst.month:02d}. {now_kst.day:02d}  {now_kst.strftime('%H:%M')} KST"
 
@@ -298,162 +279,60 @@ def _requests_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
-            "User-Agent": "daae-slack-bot/1.0 (+https://architecture.snu.ac.kr)",
+            "User-Agent": "daae-slack-bot/2.0 (+https://architecture.snu.ac.kr)",
             "Accept": "application/json",
+            "Content-Type": "application/json",
         }
     )
+    # architecture.snu.ac.kr는 여러 IP로 라운드로빈되며 일부 IP(개편 test 서버)는
+    # 외부 접속을 거부할 수 있습니다. 연결 실패 시 재시도하면 다른 IP로 재연결됩니다.
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=2,
+        backoff_factor=0.6,
+        status_forcelist=[502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
-def _wp_get_json(
+def fetch_notices(
     session: requests.Session,
     *,
     base_url: str,
-    path: str,
-    params: Dict[str, Any],
+    page: int = 1,
     timeout_sec: float = 15.0,
-) -> Any:
-    url = base_url.rstrip("/") + path
-    resp = session.get(url, params=params, timeout=timeout_sec)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def resolve_category_ids(
-    session: requests.Session,
-    *,
-    base_url: str,
-    slugs: List[str],
-) -> Tuple[List[int], List[str]]:
-    """
-    카테고리 slug 목록을 카테고리 ID 목록으로 변환합니다.
-    반환: (ids, missing_slugs)
-    """
-    slugs = [s.strip() for s in slugs if s.strip()]
-    if not slugs:
-        return [], []
-
-    data = _wp_get_json(
-        session,
-        base_url=base_url,
-        path=WP_CATEGORIES_PATH,
-        params={
-            "per_page": 100,
-            "slug": slugs,  # requests가 slug=notice&slug=pinup 형태로 인코딩
-            "_fields": "id,slug,name",
-        },
-    )
-
-    found: Dict[str, int] = {}
-    for c in data:
-        slug = str(c.get("slug", "")).strip()
-        cid = c.get("id")
-        if slug and isinstance(cid, int):
-            found[slug] = cid
-
-    missing = [s for s in slugs if s not in found]
-    ids = sorted(set(found.values()))
-    return ids, missing
-
-
-def fetch_latest_post_cursor(
-    session: requests.Session,
-    *,
-    base_url: str,
-    category_ids: List[int],
-) -> Optional[Tuple[datetime, int]]:
-    """
-    현재 시점의 최신 글(필터 적용)을 기준점(cursor)으로 가져옵니다.
-    """
-    params: Dict[str, Any] = {
-        "per_page": 1,
-        "page": 1,
-        "orderby": "date",
-        "order": "desc",
-        "_fields": "id,date_gmt",
-    }
-    if category_ids:
-        params["categories"] = ",".join(str(x) for x in category_ids)
-
-    posts = _wp_get_json(session, base_url=base_url, path=WP_POSTS_PATH, params=params)
-    if not posts:
-        return None
-
-    p = posts[0]
-    pid = int(p["id"])
-    dt = _parse_wp_date_gmt(str(p.get("date_gmt", "")).strip())
-    return dt, pid
-
-
-def fetch_new_posts(
-    session: requests.Session,
-    *,
-    base_url: str,
-    category_ids: List[int],
-    cursor_dt: datetime,
-    cursor_id: int,
-    per_page: int,
-    max_to_collect: int,
 ) -> List[Dict[str, Any]]:
     """
-    (cursor_dt, cursor_id) 이후의 새 글을 오래된 것부터(max_to_collect개까지) 수집합니다.
-    WordPress의 after 파라미터는 '엄격히 이후'이므로, 동일 초 단위 글 누락을 방지하려고 1초를 빼서 조회한 뒤
-    (dt, id) 튜플 비교로 최종 필터링합니다.
+    POST /rest/activities/getNotices 를 호출해 공지 목록(raw)을 반환합니다.
+    응답: {"err": 0, "list": [...]}  (list가 없으면 빈 리스트)
     """
-    per_page = max(1, min(int(per_page), 100))
-    max_to_collect = max(0, int(max_to_collect))
-    if max_to_collect == 0:
-        return []
+    url = base_url.rstrip("/") + NOTICES_PATH
+    resp = session.post(url, json={"page": page}, timeout=timeout_sec)
+    resp.raise_for_status()
 
-    # 동일 초 타임스탬프 방지: 1초 이전부터 조회 후, 앱에서 (dt,id)로 필터링
-    after_dt = cursor_dt - timedelta(seconds=1)
-    after_iso = _format_dt_z(after_dt)
-
-    collected: List[Dict[str, Any]] = []
-    page = 1
-
-    while True:
-        params: Dict[str, Any] = {
-            "per_page": per_page,
-            "page": page,
-            "orderby": "date",
-            "order": "asc",
-            "after": after_iso,
-            "_fields": "id,date_gmt,link,title",
-        }
-        if category_ids:
-            params["categories"] = ",".join(str(x) for x in category_ids)
-
-        try:
-            posts = _wp_get_json(session, base_url=base_url, path=WP_POSTS_PATH, params=params)
-        except requests.HTTPError as e:
-            # WordPress REST API는 "존재하지 않는 페이지(page=2인데 총 1페이지만 존재)" 요청에 대해
-            # 빈 배열이 아니라 400(rest_post_invalid_page_number)을 반환합니다.
-            # 이는 정상적인 pagination 종료 조건이므로 조용히 루프를 끝냅니다.
-            resp = getattr(e, "response", None)
-            if resp is not None and resp.status_code == 400 and page > 1:
-                try:
-                    err = resp.json()
-                    code = err.get("code")
-                except Exception:
-                    code = None
-                if code in {None, "rest_post_invalid_page_number"}:
-                    break
-            raise
-        if not posts:
-            break
-
-        for p in posts:
-            pid = int(p.get("id", 0))
-            dt = _parse_wp_date_gmt(str(p.get("date_gmt", "")).strip())
-            if (dt, pid) > (cursor_dt, cursor_id):
-                collected.append(p)
-                if len(collected) >= max_to_collect:
-                    return collected
-
-        page += 1
-
-    return collected
+    # 이 API는 JSON 본문을 보내면서도 Content-Type을 text/html로 응답하므로
+    # 헤더가 아니라 '본문'으로 판별합니다. SPA fallback(index.html)이면 본문이 '<'로 시작합니다.
+    body = resp.text or ""
+    if body.lstrip().startswith("<"):
+        snippet = body[:200].replace("\n", " ")
+        raise RuntimeError(
+            "공지 API가 JSON 대신 HTML(SPA 페이지)을 반환했습니다. "
+            f"API 경로/도메인이 바뀌었을 수 있습니다. 응답 일부: {snippet!r}"
+        )
+    try:
+        data = resp.json()
+    except ValueError as e:
+        snippet = body[:200].replace("\n", " ")
+        raise RuntimeError(f"공지 API 응답을 JSON으로 파싱하지 못했습니다: {e} / 응답 일부: {snippet!r}") from e
+    items = data.get("list")
+    if not isinstance(items, list):
+        raise RuntimeError(f"공지 API 응답에 'list'가 없습니다: {str(data)[:200]!r}")
+    return items
 
 
 def send_slack_message(
@@ -484,30 +363,19 @@ def send_slack_message(
 
 
 def _normalize_notion_page_id(page_id_or_url: str) -> str:
-    """
-    Notion 페이지 ID를 정규화합니다.
-    URL 형식: https://www.notion.so/Notice-27e2cbf5657380319715fa24fb5d4d15
-    -> 페이지 ID: 27e2cbf5657380319715fa24fb5d4d15 (하이픈 제거)
-    """
+    """Notion 페이지 ID 정규화(URL이면 마지막 32자 hex 추출, 아니면 하이픈 제거)."""
     s = (page_id_or_url or "").strip()
     if not s:
         return ""
-    
-    # URL에서 페이지 ID 추출
     if "notion.so" in s:
-        # 마지막 하이픈 이후 부분이 페이지 ID
         parts = s.split("-")
         if parts:
             page_id = parts[-1]
-            # 32자 hex 문자열인지 확인
             if len(page_id) == 32 and all(c in "0123456789abcdef" for c in page_id.lower()):
                 return page_id
-    
-    # 이미 페이지 ID인 경우 (하이픈 제거)
     s = s.replace("-", "")
     if len(s) == 32 and all(c in "0123456789abcdef" for c in s.lower()):
         return s
-    
     return s
 
 
@@ -521,9 +389,7 @@ def send_to_notion(
     is_test: bool,
     dry_run: bool = False,
 ) -> None:
-    """
-    Notion 페이지에 새 글 목록을 블록으로 추가합니다.
-    """
+    """Notion 페이지에 새 글 목록을 callout 블록으로 추가합니다."""
     if Client is None:
         raise RuntimeError("notion-client 라이브러리가 설치되지 않았습니다. pip install notion-client")
 
@@ -537,148 +403,73 @@ def send_to_notion(
 
     client = Client(auth=token)
 
-    # 각 글을 Notion 블록으로 추가
     blocks: List[Dict[str, Any]] = []
-    
-    # 헤더 블록
+
     header_text = f"{emoji} {feed_name} 새 글 {len(posts)}개"
     if is_test:
         header_text = f"[TEST] {header_text}"
-    
+
     blocks.append({
         "object": "block",
         "type": "heading_2",
-        "heading_2": {
-            "rich_text": [{"type": "text", "text": {"content": header_text}}]
-        }
+        "heading_2": {"rich_text": [{"type": "text", "text": {"content": header_text}}]},
     })
+    blocks.append({"object": "block", "type": "divider", "divider": {}})
 
-    # 구분선 추가
-    blocks.append({
-        "object": "block",
-        "type": "divider",
-        "divider": {}
-    })
-
-    # 각 글을 callout 블록으로 추가 (더 예쁘게 표시)
     for idx, p in enumerate(posts):
-        title = _clean_text(str(p.get("title", {}).get("rendered", "")))
+        title = _clean_text(str(p.get("title", ""))) or "(제목 없음)"
         link = str(p.get("link", "")).strip()
-        date_gmt = str(p.get("date_gmt", "")).strip()
-        
-        if not title:
-            title = "(제목 없음)"
-        
-        # 날짜 포맷팅 (간단하게)
-        date_str = ""
-        if date_gmt:
-            try:
-                dt = _parse_wp_date_gmt(date_gmt)
-                # YYYY-MM-DD HH:MM 형식으로 표시
-                date_str = dt.strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                date_str = date_gmt[:16] if len(date_gmt) >= 16 else date_gmt
-        
-        # Callout 블록의 rich_text 구성
-        rich_text_parts: List[Dict[str, Any]] = []
-        
-        # 제목 (bold)
-        rich_text_parts.append({
-            "type": "text",
-            "text": {"content": title},
-            "annotations": {"bold": True}
-        })
-        
-        # 날짜가 있으면 추가
+        date_str = _format_post_date(str(p.get("post_date", "")).strip())
+
+        rich_text_parts: List[Dict[str, Any]] = [
+            {"type": "text", "text": {"content": title}, "annotations": {"bold": True}}
+        ]
         if date_str:
             rich_text_parts.append({
                 "type": "text",
                 "text": {"content": f"\n📅 {date_str}"},
-                "annotations": {"bold": False}
+                "annotations": {"bold": False},
             })
-        
-        # 링크가 있으면 별도 줄로 추가
         if link:
             rich_text_parts.append({
                 "type": "text",
                 "text": {"content": "\n🔗 "},
-                "annotations": {"bold": False}
+                "annotations": {"bold": False},
             })
             rich_text_parts.append({
                 "type": "text",
-                "text": {
-                    "content": "원문 보기",
-                    "link": {"url": link}
-                },
-                "annotations": {"bold": False}
+                "text": {"content": "원문 보기", "link": {"url": link}},
+                "annotations": {"bold": False},
             })
-        
-        # Callout 블록 생성 (색상: blue)
+
         blocks.append({
             "object": "block",
             "type": "callout",
             "callout": {
                 "rich_text": rich_text_parts,
-                "icon": {
-                    "emoji": "📰"
-                },
-                "color": "blue"
-            }
+                "icon": {"emoji": "📰"},
+                "color": "blue",
+            },
         })
-        
-        # 마지막 글이 아니면 구분선 추가 (선택적)
         if idx < len(posts) - 1:
-            blocks.append({
-                "object": "block",
-                "type": "divider",
-                "divider": {}
-            })
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
 
-    # Notion API로 블록 추가 (한 번에 최대 100개까지 가능)
     try:
         client.blocks.children.append(block_id=normalized_page_id, children=blocks)
         print(f"[OK] Notion 전송 완료: {len(posts)}개 글을 페이지에 추가했습니다.")
     except Exception as e:
         error_msg = str(e)
         print(f"[ERROR] Notion API 실패: {error_msg}", file=sys.stderr)
-        # Notion 실패해도 Slack은 이미 전송했으므로 전체 프로세스를 중단하지 않음
-        # 대신 에러를 로그로 남기고 계속 진행
         raise RuntimeError(f"Notion API 실패: {error_msg}") from e
 
 
-def fetch_latest_post(
-    session: requests.Session,
-    *,
-    base_url: str,
-    category_ids: List[int],
-) -> Optional[Dict[str, Any]]:
-    params: Dict[str, Any] = {
-        "per_page": 1,
-        "page": 1,
-        "orderby": "date",
-        "order": "desc",
-        "_fields": "id,date_gmt,link,title",
-    }
-    if category_ids:
-        params["categories"] = ",".join(str(x) for x in category_ids)
-    posts = _wp_get_json(session, base_url=base_url, path=WP_POSTS_PATH, params=params)
-    if not posts:
-        return None
-    return posts[0]
-
-
-def make_stream_key(base_url: str, category_ids: List[int]) -> str:
-    base = base_url.rstrip("/")
-    if category_ids:
-        cats = ",".join(str(x) for x in sorted(set(category_ids)))
-    else:
-        cats = "all"
-    return f"{base}{WP_POSTS_PATH}|categories={cats}"
+def make_stream_key(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}{NOTICES_PATH}"
 
 
 def load_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        return {"version": 1, "streams": {}}
+        return {"version": 2, "streams": {}}
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -690,13 +481,15 @@ def save_state(path: Path, state: Dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def _prune_seen_ids(seen_ids: List[int]) -> List[int]:
+    """가장 큰 id 기준 최신 MAX_SEEN_IDS개만 유지(상태 파일 비대화 방지)."""
+    uniq = sorted(set(int(x) for x in seen_ids), reverse=True)
+    return uniq[:MAX_SEEN_IDS]
+
+
 @dataclass(frozen=True)
 class Config:
-    wp_base_url: str
-    wp_watch_all: bool
-    wp_category_ids: List[int]
-    wp_category_slugs: List[str]
-    wp_per_page: int
+    base_url: str
     max_notify_per_run: int
     send_on_first_run: bool
     state_path: Path
@@ -718,24 +511,16 @@ class Config:
 
 
 def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
-    # dotenv 로드(사용자가 .env를 만든 경우)
     load_dotenv()
 
-    wp_base_url = args.wp_base_url or os.getenv("WP_BASE_URL") or "https://architecture.snu.ac.kr"
+    # 하위호환: 기존 WP_BASE_URL 환경변수도 그대로 인식합니다.
+    base_url = (
+        args.base_url
+        or os.getenv("BASE_URL")
+        or os.getenv("WP_BASE_URL")
+        or "https://architecture.snu.ac.kr"
+    )
 
-    wp_watch_all = args.watch_all if args.watch_all is not None else _parse_bool(os.getenv("WP_WATCH_ALL"), default=False)
-
-    env_cat_ids = _parse_csv_int(os.getenv("WP_CATEGORY_IDS"))
-    env_cat_slugs = _parse_csv_str(os.getenv("WP_CATEGORY_SLUGS"))
-
-    wp_category_ids = args.category_ids if args.category_ids is not None else env_cat_ids
-    wp_category_slugs = args.category_slugs if args.category_slugs is not None else env_cat_slugs
-
-    # 아무 것도 지정하지 않으면 "공지사항(notice)"을 기본으로 감시 (노이즈 최소화)
-    if not wp_watch_all and not wp_category_ids and not wp_category_slugs:
-        wp_category_slugs = ["notice"]
-
-    wp_per_page = int(args.per_page or os.getenv("WP_PER_PAGE") or 30)
     max_notify_per_run = int(args.max_notify or os.getenv("MAX_NOTIFY_PER_RUN") or 20)
     send_on_first_run = _parse_bool(os.getenv("SEND_ON_FIRST_RUN"), default=False)
     if args.send_on_first_run is not None:
@@ -754,11 +539,7 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
     alert_emoji = os.getenv("ALERT_EMOJI") or "📰"
 
     return Config(
-        wp_base_url=wp_base_url,
-        wp_watch_all=wp_watch_all,
-        wp_category_ids=wp_category_ids,
-        wp_category_slugs=wp_category_slugs,
-        wp_per_page=wp_per_page,
+        base_url=base_url,
         max_notify_per_run=max_notify_per_run,
         send_on_first_run=send_on_first_run,
         state_path=state_path,
@@ -777,33 +558,22 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="architecture.snu.ac.kr 새 글 -> Slack 알림")
-    p.add_argument("--init", action="store_true", help="최신 글을 기준점으로 저장만 하고 종료(초기화)")
-    p.add_argument("--dry-run", action="store_true", help="Slack 전송 없이 콘솔에만 출력")
+    p = argparse.ArgumentParser(description="architecture.snu.ac.kr(SNU DAAE) 새 공지 -> Slack/Notion 알림")
+    p.add_argument("--init", action="store_true", help="현재 공지를 기준점으로 저장만 하고 종료(초기화)")
+    p.add_argument("--dry-run", action="store_true", help="전송 없이 콘솔에만 출력")
     p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 테스트 전송(상태 저장 없음)")
     p.add_argument("--ping", action="store_true", help="Slack 연결 테스트 메시지 전송")
 
-    p.add_argument("--wp-base-url", default=None, help="기본: https://architecture.snu.ac.kr")
-    p.add_argument("--watch-all", action="store_true", default=None, help="카테고리 필터 없이 전체 글 감시")
-    p.add_argument("--category-ids", default=None, help="예: 20,33 (WP_CATEGORY_IDS 대체)")
-    p.add_argument("--category-slugs", default=None, help="예: notice,pinup (WP_CATEGORY_SLUGS 대체)")
-    p.add_argument("--per-page", default=None, help="WP_PER_PAGE 대체(1~100)")
-    p.add_argument("--max-notify", default=None, help="MAX_NOTIFY_PER_RUN 대체")
+    p.add_argument("--base-url", default=None, help="기본: https://architecture.snu.ac.kr")
+    p.add_argument("--max-notify", default=None, help="MAX_NOTIFY_PER_RUN 대체(한 번에 보낼 최대 글 수)")
     p.add_argument("--send-on-first-run", action="store_true", default=None, help="상태 파일이 없을 때도 알림 전송(주의)")
     p.add_argument("--state-path", default=None, help="STATE_PATH 대체(기본 ./state.json)")
 
     p.add_argument("--slack-webhook-url", default=None, help="SLACK_WEBHOOK_URL 대체")
-    p.add_argument("--slack-channel", default=None, help="SLACK_CHANNEL 대체(웹훅 설정에 따라 무시될 수 있음)")
+    p.add_argument("--slack-channel", default=None, help="SLACK_CHANNEL 대체")
     p.add_argument("--slack-username", default=None, help="SLACK_USERNAME 대체")
 
-    ns = p.parse_args(argv)
-
-    if ns.category_ids is not None:
-        ns.category_ids = _parse_csv_int(ns.category_ids)
-    if ns.category_slugs is not None:
-        ns.category_slugs = _parse_csv_str(ns.category_slugs)
-
-    return ns
+    return p.parse_args(argv)
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -814,10 +584,10 @@ def _require(cond: bool, msg: str) -> None:
 def run(cfg: Config) -> int:
     session = _requests_session()
 
-    # Ping 모드
+    # ── Ping 모드 ──
     if cfg.ping:
         text = f"[PING] {cfg.alert_feed_name} 알림 봇 연결 테스트"
-        attachments = build_ping_attachments(feed_name=cfg.alert_feed_name, base_url=cfg.wp_base_url)
+        attachments = build_ping_attachments(feed_name=cfg.alert_feed_name, base_url=cfg.base_url)
         if cfg.dry_run:
             print(text)
             return 0
@@ -833,30 +603,14 @@ def run(cfg: Config) -> int:
         print("[OK] Ping 전송 완료")
         return 0
 
-    # 카테고리 해석
-    category_ids: List[int] = []
-    if not cfg.wp_watch_all:
-        category_ids = list(cfg.wp_category_ids)
-        resolved_ids, missing = resolve_category_ids(
-            session,
-            base_url=cfg.wp_base_url,
-            slugs=cfg.wp_category_slugs,
-        )
-        category_ids = sorted(set(category_ids) | set(resolved_ids))
-        if missing:
-            print(f"[WARN] 존재하지 않는 카테고리 slug: {missing}", file=sys.stderr)
-
-    stream_key = make_stream_key(cfg.wp_base_url, category_ids)
+    stream_key = make_stream_key(cfg.base_url)
     state = load_state(cfg.state_path)
     streams = state.setdefault("streams", {})
     stream = streams.get(stream_key)
 
     def notify(posts: List[Dict[str, Any]], *, is_test: bool) -> None:
-        """
-        Slack과 Notion으로 전송합니다.
-        """
         slack_text = build_slack_summary_text(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test)
-        slack_attachments = build_slack_attachments(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test, base_url=cfg.wp_base_url)
+        slack_attachments = build_slack_attachments(posts=posts, feed_name=cfg.alert_feed_name, emoji=cfg.alert_emoji, is_test=is_test, base_url=cfg.base_url)
 
         if cfg.dry_run:
             print(slack_text)
@@ -864,7 +618,6 @@ def run(cfg: Config) -> int:
                 print(f"[DRY-RUN] Notion 전송: {len(posts)}개 글")
             return
 
-        # Slack 전송
         if cfg.slack_webhook_url:
             send_slack_message(
                 session,
@@ -875,7 +628,6 @@ def run(cfg: Config) -> int:
                 username=cfg.slack_username,
             )
 
-        # Notion 전송
         if cfg.notion_token and cfg.notion_page_id:
             try:
                 send_to_notion(
@@ -888,134 +640,84 @@ def run(cfg: Config) -> int:
                     dry_run=cfg.dry_run,
                 )
             except Exception as e:
-                # Notion 실패해도 Slack은 이미 전송했으므로 경고만 출력하고 계속 진행
                 print(f"[WARN] Notion 전송 실패 (Slack은 정상 전송됨): {e}", file=sys.stderr)
         elif cfg.notion_token or cfg.notion_page_id:
-            # 둘 중 하나만 설정된 경우 경고
-            print(f"[WARN] Notion 전송 스킵: NOTION_TOKEN과 NOTION_PAGE_ID 둘 다 설정되어야 합니다.", file=sys.stderr)
+            print("[WARN] Notion 전송 스킵: NOTION_TOKEN과 NOTION_PAGE_ID 둘 다 설정되어야 합니다.", file=sys.stderr)
 
-    # 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송
+    # 현재 공지 목록 조회(정규화)
+    raw_items = fetch_notices(session, base_url=cfg.base_url, page=1)
+    notices = [normalize_notice(it, base_url=cfg.base_url) for it in raw_items if int(it.get("id", 0)) > 0]
+    current_ids = [p["id"] for p in notices]
+
+    # ── 테스트 모드: 상태 저장 없이 최신 글 1건을 [TEST]로 전송 ──
     if cfg.test_latest:
-        latest = fetch_latest_post(session, base_url=cfg.wp_base_url, category_ids=category_ids)
-        if latest is None:
-            text = "[TEST] architecture.snu.ac.kr 최신 글 조회 결과: 게시물이 없습니다."
+        if not notices:
+            text = "[TEST] 최신 글 조회 결과: 게시물이 없습니다."
             if cfg.dry_run:
                 print(text)
                 return 0
             _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
             send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
             return 0
-
+        # 목록 첫 항목은 '중요(고정)' 공지일 수 있어, id가 가장 큰(가장 최근 생성) 글을 최신으로 사용
+        latest = max(notices, key=lambda p: p["id"])
         notify([latest], is_test=True)
         return 0
 
-    # init 모드: 항상 최신 글 기준점으로 저장
-    if cfg.init_only:
-        cursor = fetch_latest_post_cursor(session, base_url=cfg.wp_base_url, category_ids=category_ids)
-        if cursor is None:
-            print("[INFO] 최신 글을 찾지 못했습니다. (게시물이 없을 수 있음)")
+    # ── init 모드 / 최초 실행(상태 없음, send_on_first_run=False): 기준점만 저장 ──
+    if cfg.init_only or (stream is None and not cfg.send_on_first_run):
+        mode = "초기화" if cfg.init_only else "최초 실행"
+        if cfg.dry_run:
+            print(f"[DRY-RUN] {mode}: 현재 공지 {len(current_ids)}건을 기준점으로 저장할 예정(상태 저장 안 함).")
             return 0
-        cursor_dt, cursor_id = cursor
         streams[stream_key] = {
-            "cursor": {"date_gmt": _format_dt_z(cursor_dt), "id": cursor_id},
-            "category_ids": category_ids,
+            "seen_ids": _prune_seen_ids(current_ids),
             "updated_at": _utc_now_iso(),
         }
         save_state(cfg.state_path, state)
-        print(f"[OK] 초기화 완료: cursor=({streams[stream_key]['cursor']['date_gmt']}, {cursor_id})")
+        print(f"[OK] {mode}: 현재 공지 {len(current_ids)}건을 기준점으로 저장했습니다. 이후부터 새 글만 알림됩니다.")
+        print(f"      state: {cfg.state_path}")
         return 0
 
-    # 최초 실행(상태 없음) 처리
+    # ── 새 글 판별 ──
     if stream is None:
-        if not cfg.send_on_first_run:
-            cursor = fetch_latest_post_cursor(session, base_url=cfg.wp_base_url, category_ids=category_ids)
-            if cursor is None:
-                print("[INFO] 기준점으로 삼을 최신 글이 없습니다.")
-                streams[stream_key] = {
-                    "cursor": {"date_gmt": _format_dt_z(datetime(1970, 1, 1, tzinfo=timezone.utc)), "id": 0},
-                    "category_ids": category_ids,
-                    "updated_at": _utc_now_iso(),
-                }
-            else:
-                cursor_dt, cursor_id = cursor
-                streams[stream_key] = {
-                    "cursor": {"date_gmt": _format_dt_z(cursor_dt), "id": cursor_id},
-                    "category_ids": category_ids,
-                    "updated_at": _utc_now_iso(),
-                }
+        # send_on_first_run=True: 가장 최근 글 몇 개를 보내고 전체를 seen으로 저장
+        seen_ids: set[int] = set()
+    else:
+        seen_ids = set(int(x) for x in stream.get("seen_ids", []))
+
+    new_posts = [p for p in notices if p["id"] not in seen_ids]
+    # 오래된 것부터(날짜, id) 정렬 — 날짜 동일/누락 시 id로 안정 정렬
+    new_posts.sort(key=lambda p: (p["post_date"], p["id"]))
+
+    if not new_posts:
+        # 변화 없음: seen 목록만 최신 상태로 유지(고정공지 회전 등에 견고)
+        if stream is not None and not cfg.dry_run:
+            stream["seen_ids"] = _prune_seen_ids(list(seen_ids | set(current_ids)))
+            stream["updated_at"] = _utc_now_iso()
+            streams[stream_key] = stream
             save_state(cfg.state_path, state)
-            print("[OK] 최초 실행: 스팸 방지를 위해 기준점만 저장했습니다. 이후부터 새 글만 알림됩니다.")
-            print(f"      state: {cfg.state_path}")
-            return 0
-
-        # send_on_first_run=True: 최근 max_notify_per_run개만 전송하고 그 지점으로 커서 저장(안전/효율)
-        _require(cfg.max_notify_per_run > 0, "MAX_NOTIFY_PER_RUN이 0이면 최초 전송 모드가 의미가 없습니다.")
-        params: Dict[str, Any] = {
-            "per_page": max(1, min(cfg.max_notify_per_run, 100)),
-            "page": 1,
-            "orderby": "date",
-            "order": "desc",
-            "_fields": "id,date_gmt,link,title",
-        }
-        if category_ids:
-            params["categories"] = ",".join(str(x) for x in category_ids)
-        posts = _wp_get_json(session, base_url=cfg.wp_base_url, path=WP_POSTS_PATH, params=params)
-        posts = list(reversed(posts))  # 오래된 것부터
-
-        if not posts:
-            print("[INFO] 전송할 글이 없습니다.")
-            streams[stream_key] = {
-                "cursor": {"date_gmt": _format_dt_z(datetime(1970, 1, 1, tzinfo=timezone.utc)), "id": 0},
-                "category_ids": category_ids,
-                "updated_at": _utc_now_iso(),
-            }
-            save_state(cfg.state_path, state)
-            return 0
-
-        notify(posts, is_test=False)
-
-        last = posts[-1]
-        last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())
-        last_id = int(last.get("id", 0))
-        streams[stream_key] = {
-            "cursor": {"date_gmt": _format_dt_z(last_dt), "id": last_id},
-            "category_ids": category_ids,
-            "updated_at": _utc_now_iso(),
-        }
-        save_state(cfg.state_path, state)
-        print(f"[OK] 최초 전송 완료: cursor=({streams[stream_key]['cursor']['date_gmt']}, {last_id})")
         return 0
 
-    # 정상 실행(상태 존재)
-    cursor_date = str(stream.get("cursor", {}).get("date_gmt", "1970-01-01T00:00:00Z"))
-    cursor_id = int(stream.get("cursor", {}).get("id", 0))
-    cursor_dt = _parse_wp_date_gmt(cursor_date)
+    # 한 번에 너무 많으면 가장 최근 max_notify_per_run개만 전송(전부 seen 처리하여 재알림 방지)
+    cap = max(1, cfg.max_notify_per_run)
+    to_send = new_posts[-cap:] if len(new_posts) > cap else new_posts
+    if len(new_posts) > cap:
+        print(f"[INFO] 새 글 {len(new_posts)}건 중 최근 {cap}건만 전송합니다(나머지는 알림 생략).", file=sys.stderr)
 
-    posts = fetch_new_posts(
-        session,
-        base_url=cfg.wp_base_url,
-        category_ids=category_ids,
-        cursor_dt=cursor_dt,
-        cursor_id=cursor_id,
-        per_page=cfg.wp_per_page,
-        max_to_collect=cfg.max_notify_per_run,
-    )
+    notify(to_send, is_test=False)
 
-    if not posts:
-        # 상태 갱신(선택): last_checked를 남기고 싶으면 여기에 추가 가능
+    if cfg.dry_run:
+        # 미리보기: 상태를 변경하지 않습니다.
+        print(f"[DRY-RUN] 새 글 {len(to_send)}건(상태 저장 안 함).")
         return 0
 
-    notify(posts, is_test=False)
-
-    last = posts[-1]
-    last_dt = _parse_wp_date_gmt(str(last.get("date_gmt", "")).strip())
-    last_id = int(last.get("id", 0))
-    stream["cursor"] = {"date_gmt": _format_dt_z(last_dt), "id": last_id}
-    stream["category_ids"] = category_ids
-    stream["updated_at"] = _utc_now_iso()
-    streams[stream_key] = stream
+    streams[stream_key] = {
+        "seen_ids": _prune_seen_ids(list(seen_ids | set(current_ids))),
+        "updated_at": _utc_now_iso(),
+    }
     save_state(cfg.state_path, state)
-
+    print(f"[OK] 전송 완료: 새 글 {len(to_send)}건 알림, seen {len(streams[stream_key]['seen_ids'])}건 저장.")
     return 0
 
 
@@ -1037,5 +739,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
