@@ -123,7 +123,7 @@ WP_WATCH_ALL=true
 - 파일: `.github/workflows/architecture_snu_notify.yml`
 - 기본 주기: **10분마다 실행**(UTC 기준)
 - 감시 범위: **사이트 전체(posts)** (`WP_WATCH_ALL=true`)
-- 중복 방지: `state.json`을 **GitHub Actions cache로 유지**
+- 중복 방지: `state.json`을 **레포에 커밋해서 영구 보존**(아래 참고)
 
 ### 1) Slack Webhook을 GitHub Secret으로 등록
 GitHub 레포 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
@@ -136,11 +136,30 @@ GitHub 레포 → **Settings** → **Secrets and variables** → **Actions** →
 ### 2) 워크플로우 수동 실행(테스트)
 GitHub 레포 → **Actions** 탭 → 워크플로우 선택 → **Run workflow**
 
-### 3) 상태(state) 보존에 대한 주의사항
-GitHub Actions cache는 **best-effort**라서, 드물게 만료/정리되면 `state.json`이 사라질 수 있습니다.
+### 3) 상태(state) 보존 방식 — 레포에 커밋
+예전에는 `state.json`을 **GitHub Actions cache**로 유지했지만, 캐시는 **best-effort**라서 만료/정리되면 상태가 사라졌습니다.
+그러면 매번 “첫 실행” 경로(`SEND_ON_FIRST_RUN=false`)로 빠져 **기준점만 저장하고 알림을 보내지 않아**, 결과적으로 알림이 조용히 멈추는 문제가 있었습니다.
 
-- 기본 동작(`SEND_ON_FIRST_RUN=false`): 상태가 없으면 **기준점만 저장하고 알림은 보내지 않음(스팸 방지)**
+이제는 상태를 **레포의 `state.json` 파일로 커밋**해서 영구 보존합니다.
+
+- `actions/checkout`이 최신 `state.json`을 가져오고, 봇 실행 후 변경되면 워크플로우가 다시 커밋/푸시합니다.
+- 이를 위해 워크플로우 job에는 **`permissions: contents: write`** 가 필요합니다(keepalive 워크플로우와 동일한 방식).
+- 커밋은 **실제 알림 실행 경로(schedule / workflow_dispatch)** 에서, **`state.json`이 바뀐 경우에만** 이루어집니다.
+- 커밋 메시지에 **`[skip ci]`** 를 넣어 커밋으로 인한 재실행을 막고, keepalive 등 다른 워크플로우와의 충돌에 대비해 push 전에 `git pull --rebase` 후 실패 시 1회 재시도합니다.
+- 레포에는 **기준(baseline) `state.json`**(`{"version": 2, "streams": {}}`)이 커밋되어 있어, 첫 스케줄 실행이 예측 가능하게 기준점을 세웁니다.
+- 기본 동작(`SEND_ON_FIRST_RUN=false`): 상태가 비어 있으면 **기준점만 저장하고 알림은 보내지 않음(스팸 방지)**. 상태가 커밋으로 보존되므로 이 “첫 실행”은 사실상 한 번만 발생합니다.
 - 필요하면 `SEND_ON_FIRST_RUN=true`로 바꿔서 “상태 초기화 시 최근 글도 전송”하도록 할 수 있지만 스팸 위험이 있습니다.
+
+### 3-1) 정기 생존 신호(heartbeat)
+알림이 없어도 봇이 살아있는지 확인할 수 있도록, 워크플로우는 **매일 1회(00:00 UTC = 09:00 KST)** heartbeat 메시지를 Slack으로 보냅니다.
+
+- 해당 단계는 `python bot.py --heartbeat`를 실행하며, 상태(`state.json`)를 저장하지 않습니다.
+- `continue-on-error: true`로 설정되어 있어 **heartbeat 실패가 본 알림(notifier)을 실패시키지 않습니다.**
+- 로컬에서 직접 보내려면: `python3 bot.py --heartbeat`
+
+### 3-2) 실패 알림(failure notification)
+봇 실행 중 오류가 나거나(API 드리프트/네트워크 등) Slack Webhook이 설정되지 않은 경우, 예전에는 **조용히 실패**해서 알림이 안 오는 이유를 알기 어려웠습니다.
+이제는 가능한 경우 **실패 사실을 Slack으로 알려**, 문제를 빨리 인지할 수 있도록 개선했습니다(자세한 동작은 코드/워크플로우 로그 참고).
 
 ### 4) 수동 실행에서 “최신 글 1건 [TEST] 전송” 옵션
 워크플로우는 수동 실행 시 입력값으로 아래 옵션을 제공합니다.

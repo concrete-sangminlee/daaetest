@@ -10,6 +10,9 @@ venv/
 ENV/
 
 .env
-state.json
+
+# state.json is intentionally committed to the repo so notifier state
+# (the last-seen cursor) survives reliably between scheduled runs.
+# It is NOT ignored. Do not add it back here.
 
 
