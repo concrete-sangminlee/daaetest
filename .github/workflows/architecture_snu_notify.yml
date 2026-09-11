@@ -5,6 +5,9 @@ on:
     # GitHub Actions cron은 UTC 기준입니다.
     # 최소 주기는 5분이며, 필요하면 */5로 조정하세요.
     - cron: "*/10 * * * *"
+    # 매일 00:00 UTC(=09:00 KST)에 실행되는 heartbeat용 스케줄.
+    # 이 시각에도 위 10분 주기 알림은 그대로 동작하고, 추가로 heartbeat 1건을 보냅니다.
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       ping:
@@ -24,8 +27,9 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # state.json을 레포에 커밋해서 상태를 영구 보존하므로 쓰기 권한이 필요합니다.
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
@@ -42,16 +46,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # state.json은 커밋하지 않고, Actions 캐시로만 "최신 커서"를 유지합니다.
-      # 캐시는 best-effort라서(만료/삭제 가능) 드물게 state가 초기화될 수 있습니다.
-      # 그 경우 첫 실행은 기준점 저장만 하고 종료(SEND_ON_FIRST_RUN=false)하도록 구성했습니다.
-      - name: Restore state (cache)
-        uses: actions/cache/restore@v4
-        with:
-          path: state.json
-          key: state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            state-${{ runner.os }}-${{ github.ref_name }}-
+      # 상태(state.json)는 이제 Actions 캐시가 아니라 레포에 커밋되어 유지됩니다.
+      # actions/checkout이 이미 최신 state.json을 워킹트리에 가져오므로 별도 복원 단계가 필요 없습니다.
 
       - name: Slack ping (manual run only)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.ping == 'true' }}
@@ -91,11 +87,39 @@ jobs:
         run: |
           python bot.py
 
-      - name: Save state (cache)
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: state.json
-          key: state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+      # 갱신된 state.json을 레포에 커밋해 상태를 영구 보존합니다.
+      # - 실제 알림 실행 경로(schedule / workflow_dispatch)에서만 커밋합니다.
+      # - state.json이 실제로 바뀐 경우에만 커밋/푸시합니다.
+      # - keepalive 워크플로우 등과의 충돌 대비: push 전에 rebase, 거절 시 1회 재시도.
+      # - 커밋 메시지에 [skip ci]를 넣어 재실행을 방지합니다.
+      - name: Commit updated state
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --quiet --cached; then
+            echo "state.json 변경 없음 — 커밋 건너뜀"
+            exit 0
+          fi
+          git commit -m "chore: update notifier state [skip ci]"
+          git pull --rebase --autostash origin "${{ github.ref_name }}"
+          if ! git push origin "HEAD:${{ github.ref_name }}"; then
+            echo "push 거절 — rebase 후 1회 재시도"
+            git pull --rebase --autostash origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
 
-
+      # 정기 생존 신호(heartbeat): 매일 00:00 UTC 스케줄에서만 전송합니다.
+      # continue-on-error로 heartbeat 실패가 워크플로우(본 알림)를 실패시키지 않도록 합니다.
+      - name: Heartbeat (daily)
+        if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 0 * * *' }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          BASE_URL: "https://architecture.snu.ac.kr"
+          ALERT_FEED_NAME: "건축학과"
+          ALERT_EMOJI: "💚"
+        run: |
+          python bot.py --heartbeat
