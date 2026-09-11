@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Make the repo root importable and install offline dependency stubs before
 # importing bot (bot.py imports requests/dotenv at module top level).
@@ -248,6 +249,191 @@ class PruneSeenIdsTests(unittest.TestCase):
         self.assertEqual(len(pruned), bot.MAX_SEEN_IDS)
         # keeps the largest ids
         self.assertEqual(pruned[0], bot.MAX_SEEN_IDS + 49)
+
+
+def _make_config(**overrides):
+    """Build a Config with sensible offline defaults; override individual fields."""
+    defaults = dict(
+        base_url=BASE_URL,
+        max_notify_per_run=20,
+        send_on_first_run=False,
+        state_path=Path("./state.json"),
+        slack_webhook_url=None,
+        slack_channel=None,
+        slack_username=None,
+        notion_token=None,
+        notion_page_id=None,
+        alert_feed_name="건축학과",
+        alert_emoji="📰",
+        dry_run=False,
+        init_only=False,
+        test_latest=False,
+        ping=False,
+        heartbeat=False,
+    )
+    defaults.update(overrides)
+    return bot.Config(**defaults)
+
+
+class BuildFailureAttachmentsTests(unittest.TestCase):
+    def test_returns_red_attachment_with_summary(self):
+        attachments = bot.build_failure_attachments(
+            feed_name="건축학과",
+            error_summary="공지 API가 JSON 대신 HTML을 반환했습니다.",
+            base_url=BASE_URL,
+        )
+        self.assertEqual(len(attachments), 1)
+        att = attachments[0]
+        self.assertEqual(att["color"], "#e01e5a")
+        self.assertIsInstance(att["blocks"], list)
+        section_text = att["blocks"][0]["text"]["text"]
+        self.assertIn("공지 API가 JSON 대신 HTML을 반환했습니다.", section_text)
+
+    def test_truncates_long_summary(self):
+        long_summary = "x" * 2000
+        attachments = bot.build_failure_attachments(
+            feed_name="건축학과", error_summary=long_summary
+        )
+        section_text = attachments[0]["blocks"][0]["text"]["text"]
+        # truncated body should be far shorter than the raw 2000 chars
+        self.assertLessEqual(section_text.count("x"), bot.MAX_ERROR_SUMMARY_CHARS)
+        self.assertIn("생략", section_text)
+
+    def test_does_not_echo_secret_values(self):
+        # The builder only receives an error summary; secrets are never passed in.
+        secret = "https://hooks.slack.com/services/T000/B000/XXXXSECRET"
+        attachments = bot.build_failure_attachments(
+            feed_name="건축학과", error_summary="네트워크 오류가 발생했습니다."
+        )
+        blob = repr(attachments)
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("XXXXSECRET", blob)
+
+    def test_empty_summary_has_placeholder(self):
+        attachments = bot.build_failure_attachments(
+            feed_name="건축학과", error_summary=""
+        )
+        section_text = attachments[0]["blocks"][0]["text"]["text"]
+        self.assertIn("원인 정보 없음", section_text)
+
+
+class BuildHeartbeatAttachmentsTests(unittest.TestCase):
+    def test_returns_green_attachment(self):
+        attachments = bot.build_heartbeat_attachments(
+            feed_name="건축학과", base_url=BASE_URL
+        )
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["color"], "#2eb67d")
+        self.assertIsInstance(attachments[0]["blocks"], list)
+        section_text = attachments[0]["blocks"][0]["text"]["text"]
+        self.assertIn("정상 동작 중", section_text)
+
+
+class _FakeSession:
+    """Stand-in returned by a patched bot._requests_session so run() never builds
+    the real requests/urllib3 network stack (unavailable/old in the sandbox)."""
+
+    def post(self, *args, **kwargs):  # pragma: no cover - should be monkeypatched away
+        raise RuntimeError("network disabled in tests")
+
+
+class HeartbeatModeTests(unittest.TestCase):
+    def test_dry_run_prints_and_returns_zero(self):
+        cfg = _make_config(heartbeat=True, dry_run=True)
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "send_slack_message") as send:
+            rc = bot.run(cfg)
+        self.assertEqual(rc, 0)
+        send.assert_not_called()
+
+    def test_requires_webhook_when_not_dry_run(self):
+        cfg = _make_config(heartbeat=True, dry_run=False, slack_webhook_url=None)
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()):
+            with self.assertRaises(SystemExit):
+                bot.run(cfg)
+
+    def test_sends_heartbeat_when_webhook_present(self):
+        cfg = _make_config(
+            heartbeat=True, dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "send_slack_message") as send:
+            rc = bot.run(cfg)
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        _, kwargs = send.call_args
+        self.assertIn("[HEARTBEAT]", kwargs["text"])
+
+
+class MissingWebhookGuardTests(unittest.TestCase):
+    def test_real_run_without_webhook_or_notion_raises(self):
+        cfg = _make_config(dry_run=False, slack_webhook_url=None)
+        # Stub fetch_notices so no network is attempted; the guard runs before fetch.
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "fetch_notices", return_value=[]):
+            with self.assertRaises(SystemExit):
+                bot.run(cfg)
+
+    def test_dry_run_without_webhook_is_allowed(self):
+        cfg = _make_config(dry_run=True, slack_webhook_url=None)
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "fetch_notices", return_value=[]):
+            # init-like first run baseline path prints and returns 0 (no webhook needed)
+            rc = bot.run(cfg)
+        self.assertEqual(rc, 0)
+
+
+class FailureNotificationTests(unittest.TestCase):
+    def test_send_failure_notification_calls_slack(self):
+        cfg = _make_config(slack_webhook_url="https://example/webhook")
+        with mock.patch.object(bot, "send_slack_message") as send:
+            bot.send_failure_notification(
+                object(), cfg=cfg, error_summary="boom"
+            )
+        send.assert_called_once()
+        _, kwargs = send.call_args
+        self.assertIn("[ERROR]", kwargs["text"])
+
+    def test_send_failure_notification_noop_without_webhook(self):
+        cfg = _make_config(slack_webhook_url=None)
+        with mock.patch.object(bot, "send_slack_message") as send:
+            bot.send_failure_notification(object(), cfg=cfg, error_summary="boom")
+        send.assert_not_called()
+
+    def test_send_failure_notification_is_best_effort(self):
+        cfg = _make_config(slack_webhook_url="https://example/webhook")
+        with mock.patch.object(
+            bot, "send_slack_message", side_effect=RuntimeError("secondary")
+        ):
+            # Must NOT raise even though the inner send fails.
+            bot.send_failure_notification(object(), cfg=cfg, error_summary="boom")
+
+    def test_run_failure_triggers_notification_and_nonzero_exit(self):
+        cfg = _make_config(
+            dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        calls = []
+
+        def _record(*args, **kwargs):
+            calls.append(kwargs)
+
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(
+                    bot, "fetch_notices", side_effect=RuntimeError("API drift: HTML")
+                ), mock.patch.object(bot, "send_slack_message", side_effect=_record), \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        # Non-zero exit
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertNotEqual(ctx.exception.code, None)
+        # A failure notification was attempted with the [ERROR] fallback text.
+        self.assertTrue(calls, "expected a failure Slack call")
+        self.assertTrue(any("[ERROR]" in c.get("text", "") for c in calls))
 
 
 if __name__ == "__main__":

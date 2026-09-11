@@ -275,6 +275,76 @@ def build_ping_attachments(*, feed_name: str, base_url: str = "") -> List[Dict[s
     return [{"color": "#2eb67d", "blocks": blocks}]
 
 
+# 실패 알림 본문 길이 상한(거대한 스택트레이스/응답이 Slack 페이로드를 폭주시키지 않도록).
+MAX_ERROR_SUMMARY_CHARS = 500
+
+
+def build_heartbeat_attachments(*, feed_name: str, base_url: str = "") -> List[Dict[str, Any]]:
+    """정기 생존 신호(heartbeat)용 메시지. ping과 동일한 그린 컬러바(#2eb67d)."""
+    now_kst = datetime.now(_KST)
+    ts = f"{now_kst.year}. {now_kst.month:02d}. {now_kst.day:02d}  {now_kst.strftime('%H:%M')} KST"
+
+    site_domain = (
+        base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        if base_url else ""
+    )
+    status_line = f"💓  *정상 동작 중*\n{feed_name} 알림 봇이 예정대로 실행되고 있습니다."
+    if site_domain:
+        status_line += f"\n🔗  대상 사이트: {site_domain}"
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": status_line},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"🏫 {feed_name} Notice Bot  ｜  {ts}"}],
+        },
+    ]
+
+    return [{"color": "#2eb67d", "blocks": blocks}]
+
+
+def build_failure_attachments(
+    *,
+    feed_name: str,
+    error_summary: str,
+    base_url: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    실행 실패를 눈에 띄게 알리는 메시지. 레드 컬러바(#e01e5a).
+    error_summary는 과도한 페이로드 방지를 위해 앞부분만 사용하며,
+    환경변수/시크릿 값은 절대 여기에 넣지 않습니다(호출부에서 예외 메시지만 전달).
+    """
+    summary = (error_summary or "").strip()
+    if len(summary) > MAX_ERROR_SUMMARY_CHARS:
+        summary = summary[:MAX_ERROR_SUMMARY_CHARS] + "…(생략)"
+    if not summary:
+        summary = "(원인 정보 없음)"
+
+    now_kst = datetime.now(_KST)
+    ts = f"{now_kst.year}. {now_kst.month:02d}. {now_kst.day:02d}  {now_kst.strftime('%H:%M')} KST"
+
+    status_line = (
+        f"🚨  *알림 봇 실행 실패*\n{feed_name} 공지 알림을 처리하는 중 오류가 발생했습니다.\n"
+        f"```{summary}```"
+    )
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": status_line},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"🏫 {feed_name} Notice Bot  ｜  {ts}"}],
+        },
+    ]
+
+    return [{"color": "#e01e5a", "blocks": blocks}]
+
+
 def _requests_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
@@ -360,6 +430,38 @@ def send_slack_message(
     resp = session.post(webhook_url, json=payload, timeout=timeout_sec)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Slack webhook 실패: HTTP {resp.status_code} / body={resp.text[:300]!r}")
+
+
+def send_failure_notification(
+    session: requests.Session,
+    *,
+    cfg: "Config",
+    error_summary: str,
+) -> None:
+    """
+    실행 실패 시 Slack으로 실패 알림을 보냅니다(best-effort).
+    이 함수 자체가 다시 실패하더라도 원래의 오류를 가리지 않도록,
+    내부에서 예외를 잡아 stderr로만 남기고 조용히 반환합니다.
+    """
+    if not cfg.slack_webhook_url:
+        return
+    try:
+        text = f"[ERROR] {cfg.alert_feed_name} 알림 봇 실행 실패"
+        attachments = build_failure_attachments(
+            feed_name=cfg.alert_feed_name,
+            error_summary=error_summary,
+            base_url=cfg.base_url,
+        )
+        send_slack_message(
+            session,
+            webhook_url=str(cfg.slack_webhook_url),
+            text=text,
+            attachments=attachments,
+            channel=cfg.slack_channel,
+            username=cfg.slack_username,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort, must not mask original error
+        print(f"[WARN] 실패 알림 전송에 실패했습니다(원래 오류는 별도 출력됨): {e}", file=sys.stderr)
 
 
 def _normalize_notion_page_id(page_id_or_url: str) -> str:
@@ -508,6 +610,7 @@ class Config:
     init_only: bool
     test_latest: bool
     ping: bool
+    heartbeat: bool
 
 
 def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
@@ -554,6 +657,7 @@ def build_config_from_env_and_args(args: argparse.Namespace) -> Config:
         init_only=bool(args.init),
         test_latest=bool(args.test_latest),
         ping=bool(args.ping),
+        heartbeat=bool(args.heartbeat),
     )
 
 
@@ -563,6 +667,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="전송 없이 콘솔에만 출력")
     p.add_argument("--test-latest", action="store_true", help="최신 글 1건을 테스트 전송(상태 저장 없음)")
     p.add_argument("--ping", action="store_true", help="Slack 연결 테스트 메시지 전송")
+    p.add_argument("--heartbeat", action="store_true", help="정기 생존 신호(정상 동작 중) 메시지 전송(상태 저장 없음)")
 
     p.add_argument("--base-url", default=None, help="기본: https://architecture.snu.ac.kr")
     p.add_argument("--max-notify", default=None, help="MAX_NOTIFY_PER_RUN 대체(한 번에 보낼 최대 글 수)")
@@ -582,7 +687,13 @@ def _require(cond: bool, msg: str) -> None:
 
 
 def run(cfg: Config) -> int:
-    session = _requests_session()
+    # dry-run 경로는 네트워크 세션이 필요 없으므로, 실제 전송이 필요한 시점에만 세션을 만듭니다.
+    _session_holder: List[requests.Session] = []
+
+    def get_session() -> requests.Session:
+        if not _session_holder:
+            _session_holder.append(_requests_session())
+        return _session_holder[0]
 
     # ── Ping 모드 ──
     if cfg.ping:
@@ -593,7 +704,7 @@ def run(cfg: Config) -> int:
             return 0
         _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다.")
         send_slack_message(
-            session,
+            get_session(),
             webhook_url=str(cfg.slack_webhook_url),
             text=text,
             attachments=attachments,
@@ -601,6 +712,25 @@ def run(cfg: Config) -> int:
             username=cfg.slack_username,
         )
         print("[OK] Ping 전송 완료")
+        return 0
+
+    # ── Heartbeat 모드(정기 생존 신호) ──
+    if cfg.heartbeat:
+        text = f"[HEARTBEAT] {cfg.alert_feed_name} 알림 봇 정상 동작 중"
+        attachments = build_heartbeat_attachments(feed_name=cfg.alert_feed_name, base_url=cfg.base_url)
+        if cfg.dry_run:
+            print(text)
+            return 0
+        _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다.")
+        send_slack_message(
+            get_session(),
+            webhook_url=str(cfg.slack_webhook_url),
+            text=text,
+            attachments=attachments,
+            channel=cfg.slack_channel,
+            username=cfg.slack_username,
+        )
+        print("[OK] Heartbeat 전송 완료")
         return 0
 
     stream_key = make_stream_key(cfg.base_url)
@@ -620,7 +750,7 @@ def run(cfg: Config) -> int:
 
         if cfg.slack_webhook_url:
             send_slack_message(
-                session,
+                get_session(),
                 webhook_url=str(cfg.slack_webhook_url),
                 text=slack_text,
                 attachments=slack_attachments,
@@ -644,8 +774,17 @@ def run(cfg: Config) -> int:
         elif cfg.notion_token or cfg.notion_page_id:
             print("[WARN] Notion 전송 스킵: NOTION_TOKEN과 NOTION_PAGE_ID 둘 다 설정되어야 합니다.", file=sys.stderr)
 
+    # 알림 대상이 하나도 없으면(실전 실행에서 Slack/Notion 모두 미설정) 조용히 종료하지 않고
+    # 명시적으로 실패시켜 '알람이 안 오는' 무음 장애를 눈에 보이게 만듭니다. dry-run은 예외.
+    has_notion_target = bool(cfg.notion_token and cfg.notion_page_id)
+    if not cfg.dry_run and not cfg.init_only:
+        _require(
+            bool(cfg.slack_webhook_url) or has_notion_target,
+            "SLACK_WEBHOOK_URL(또는 Notion 설정)이 없어 알림을 보낼 수 없습니다.",
+        )
+
     # 현재 공지 목록 조회(정규화)
-    raw_items = fetch_notices(session, base_url=cfg.base_url, page=1)
+    raw_items = fetch_notices(get_session(), base_url=cfg.base_url, page=1)
     notices = [normalize_notice(it, base_url=cfg.base_url) for it in raw_items if int(it.get("id", 0)) > 0]
     current_ids = [p["id"] for p in notices]
 
@@ -657,7 +796,7 @@ def run(cfg: Config) -> int:
                 print(text)
                 return 0
             _require(bool(cfg.slack_webhook_url), "SLACK_WEBHOOK_URL이 필요합니다. (dry-run이면 필요 없음)")
-            send_slack_message(session, webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
+            send_slack_message(get_session(), webhook_url=str(cfg.slack_webhook_url), text=text, channel=cfg.slack_channel, username=cfg.slack_username)
             return 0
         # 목록 첫 항목은 '중요(고정)' 공지일 수 있어, id가 가장 큰(가장 최근 생성) 글을 최신으로 사용
         latest = max(notices, key=lambda p: p["id"])
@@ -721,19 +860,50 @@ def run(cfg: Config) -> int:
     return 0
 
 
+def _report_failure(cfg: Optional[Config], prefix: str, error: BaseException) -> None:
+    """실행 실패를 stderr에 남기고, 가능하면 Slack 실패 알림도 시도합니다(best-effort)."""
+    print(f"{prefix}: {error}", file=sys.stderr)
+    # cfg가 아직 없거나(설정 단계 실패), dry-run이거나, webhook이 없으면 Slack 알림은 생략.
+    if cfg is None or cfg.dry_run or not cfg.slack_webhook_url:
+        return
+    try:
+        session = _requests_session()
+        send_failure_notification(session, cfg=cfg, error_summary=str(error))
+    except Exception as e:  # noqa: BLE001 - 실패 알림 실패가 원래 오류를 가리지 않도록.
+        print(f"[WARN] 실패 알림 처리 중 추가 오류: {e}", file=sys.stderr)
+
+
 def main() -> None:
+    # cfg는 설정 단계에서 실패할 수 있으므로 먼저 None으로 두고, 만들어지면 실패 알림에 사용합니다.
+    cfg: Optional[Config] = None
     try:
         args = parse_args(sys.argv[1:])
         cfg = build_config_from_env_and_args(args)
+    except SystemExit:
+        # argparse가 던지는 정상적인 종료(예: --help, 잘못된 인자)는 그대로 전파.
+        raise
+    except Exception as e:
+        # 설정 구성 단계 실패: cfg가 없으므로 Slack 알림은 불가, 안전하게 비정상 종료.
+        print(f"[ERROR] 설정 오류: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+    try:
         raise SystemExit(run(cfg))
+    except SystemExit as e:
+        # run()이 반환한 종료 코드. 0이면 정상 종료, 그 외에는 실패 알림 시도.
+        code = e.code
+        if code is None or code == 0:
+            raise
+        _report_failure(cfg, "[ERROR] 실행 실패", RuntimeError(str(code)))
+        raise SystemExit(2)
     except requests.HTTPError as e:
-        print(f"[ERROR] HTTP 오류: {e}", file=sys.stderr)
+        _report_failure(cfg, "[ERROR] HTTP 오류", e)
         raise SystemExit(2)
     except requests.RequestException as e:
-        print(f"[ERROR] 네트워크 오류: {e}", file=sys.stderr)
+        _report_failure(cfg, "[ERROR] 네트워크 오류", e)
         raise SystemExit(2)
     except Exception as e:
-        print(f"[ERROR] 예외: {e}", file=sys.stderr)
+        _report_failure(cfg, "[ERROR] 예외", e)
         raise SystemExit(2)
 
 
