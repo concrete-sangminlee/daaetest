@@ -436,5 +436,312 @@ class FailureNotificationTests(unittest.TestCase):
         self.assertTrue(any("[ERROR]" in c.get("text", "") for c in calls))
 
 
+class _ScriptedPages:
+    """Callable stand-in for bot.fetch_notices that returns scripted raw pages
+    keyed by page number. Records the pages requested so tests can assert the
+    walker stopped at the right point (never hits the network)."""
+
+    def __init__(self, pages_by_num):
+        # pages_by_num: {1: [items...], 2: [...], ...}; missing page -> [] (empty)
+        self.pages_by_num = pages_by_num
+        self.requested_pages = []
+
+    def __call__(self, session, *, base_url, page=1, timeout_sec=15.0):
+        self.requested_pages.append(page)
+        return list(self.pages_by_num.get(page, []))
+
+
+def _raw_item(pid, *, post_date="2026.01.01"):
+    return {
+        "id": pid,
+        "title": f"공지 {pid}",
+        "category": "학사",
+        "ctype": "notice",
+        "post_date": post_date,
+    }
+
+
+class FetchAllNewNoticesTests(unittest.TestCase):
+    def test_walks_all_new_pages_then_stops_on_empty(self):
+        # 3 pages all-new, page 4 empty -> everything collected, stops on empty page.
+        scripted = _ScriptedPages({
+            1: [_raw_item(101), _raw_item(102)],
+            2: [_raw_item(103), _raw_item(104)],
+            3: [_raw_item(105)],
+            # page 4 missing -> empty
+        })
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=set()
+            )
+        self.assertEqual([p["id"] for p in notices], [101, 102, 103, 104, 105])
+        self.assertEqual(current_ids, [101, 102, 103, 104, 105])
+        # Walked pages 1..4 (4 was the empty stop).
+        self.assertEqual(scripted.requested_pages, [1, 2, 3, 4])
+
+    def test_stops_when_page_has_no_new_posts(self):
+        # page 1 all new, page 2 entirely already-seen -> stop, do NOT fetch page 3.
+        scripted = _ScriptedPages({
+            1: [_raw_item(201), _raw_item(202)],
+            2: [_raw_item(10), _raw_item(11)],
+            3: [_raw_item(300)],  # should never be requested
+        })
+        seen = {10, 11}
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=seen
+            )
+        # page 2 was fetched (its ids collected) but page 3 was not.
+        self.assertEqual(scripted.requested_pages, [1, 2])
+        self.assertEqual([p["id"] for p in notices], [201, 202, 10, 11])
+        self.assertEqual(current_ids, [201, 202, 10, 11])
+
+    def test_max_pages_cap_halts_infinite_api(self):
+        # An API that always returns a brand-new item would loop forever without the cap.
+        class _InfiniteAPI:
+            def __init__(self):
+                self.requested_pages = []
+
+            def __call__(self, session, *, base_url, page=1, timeout_sec=15.0):
+                self.requested_pages.append(page)
+                # Every page yields a unique, never-before-seen id.
+                return [_raw_item(1000 + page)]
+
+        api = _InfiniteAPI()
+        with mock.patch.object(bot, "fetch_notices", side_effect=api):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=set(), max_pages=3
+            )
+        # Exactly max_pages requests, then stop.
+        self.assertEqual(api.requested_pages, [1, 2, 3])
+        self.assertEqual([p["id"] for p in notices], [1001, 1002, 1003])
+        self.assertEqual(current_ids, [1001, 1002, 1003])
+
+    def test_single_page_behaviour_matches_legacy(self):
+        # One page of new posts, page 2 empty -> same result a single fetch would give.
+        scripted = _ScriptedPages({1: [_raw_item(1), _raw_item(2)]})
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=set()
+            )
+        self.assertEqual([p["id"] for p in notices], [1, 2])
+        self.assertEqual(current_ids, [1, 2])
+        # page 1 had new posts so page 2 is probed and comes back empty -> stop.
+        self.assertEqual(scripted.requested_pages, [1, 2])
+
+    def test_dedupes_pinned_notice_repeated_across_pages(self):
+        # A pinned notice (id 500) appears on both page 1 and page 2.
+        scripted = _ScriptedPages({
+            1: [_raw_item(500), _raw_item(401)],
+            2: [_raw_item(500), _raw_item(402)],
+        })
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=set()
+            )
+        # 500 collected only once.
+        self.assertEqual([p["id"] for p in notices], [500, 401, 402])
+        self.assertEqual(current_ids, [500, 401, 402])
+
+    def test_pinned_only_unseen_id_on_later_page_does_not_over_walk(self):
+        # A still-unseen pinned notice (id 500) sits on page 1 and is repeated on
+        # page 2, but page 2 is otherwise entirely already-seen. Page 2 therefore
+        # contributes no NEW post (500 was already accumulated on page 1; the rest
+        # are in seen_ids), so the walker must stop and NOT fetch page 3.
+        # 'has_new' is computed against ids not already accumulated AND unseen, so
+        # the already-collected pinned id no longer keeps the walk alive by itself.
+        scripted = _ScriptedPages({
+            1: [_raw_item(500), _raw_item(601)],
+            2: [_raw_item(500), _raw_item(10)],  # 500 already accumulated, 10 already seen
+            3: [_raw_item(700)],  # must never be requested
+        })
+        seen = {10}
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=seen
+            )
+        # Page 2 fetched (id 10 collected) but page 3 NOT fetched.
+        self.assertEqual(scripted.requested_pages, [1, 2])
+        # 500 collected once, 601 (new), 10 (seen but still accumulated on this run).
+        self.assertEqual([p["id"] for p in notices], [500, 601, 10])
+        self.assertEqual(current_ids, [500, 601, 10])
+
+    def test_html_drift_runtimeerror_propagates(self):
+        def _drift(session, *, base_url, page=1, timeout_sec=15.0):
+            raise RuntimeError("공지 API가 JSON 대신 HTML(SPA 페이지)을 반환했습니다.")
+
+        with mock.patch.object(bot, "fetch_notices", side_effect=_drift):
+            with self.assertRaises(RuntimeError):
+                bot.fetch_all_new_notices(
+                    _FakeSession(), base_url=BASE_URL, seen_ids=set()
+                )
+
+
+class PaginationRunTests(unittest.TestCase):
+    def _state_with_seen(self, seen_ids):
+        return {
+            "version": 2,
+            "streams": {
+                bot.make_stream_key(BASE_URL): {
+                    "seen_ids": list(seen_ids),
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            },
+        }
+
+    def test_run_notifies_across_multiple_pages_and_saves_all_ids(self):
+        # Existing state has one seen id (1). New posts are spread over pages 1..2,
+        # page 3 has only already-seen ids -> walker stops there.
+        with tempfile.TemporaryDirectory() as d:
+            state_path = Path(d) / "state.json"
+            bot.save_state(state_path, self._state_with_seen([1]))
+
+            cfg = _make_config(
+                dry_run=False,
+                slack_webhook_url="https://example/webhook",
+                state_path=state_path,
+            )
+
+            scripted = _ScriptedPages({
+                1: [_raw_item(1, post_date="2026.01.01"), _raw_item(20, post_date="2026.02.02")],
+                2: [_raw_item(21, post_date="2026.02.03"), _raw_item(22, post_date="2026.02.04")],
+                3: [_raw_item(1, post_date="2026.01.01")],  # only already-seen -> stop
+            })
+
+            sent = {}
+
+            def _capture_notify(posts, *, is_test):
+                sent["posts"] = list(posts)
+                sent["is_test"] = is_test
+
+            with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                    mock.patch.object(bot, "fetch_notices", side_effect=scripted), \
+                    mock.patch.object(bot, "send_slack_message"):
+                # Patch notify indirectly: intercept build via send_slack_message is
+                # enough, but we assert on the posts passed to notify by inspecting
+                # the slack summary text instead.
+                with mock.patch.object(bot, "build_slack_summary_text", side_effect=lambda *, posts, **k: _capture_notify(posts, is_test=False) or "text"):
+                    rc = bot.run(cfg)
+
+            self.assertEqual(rc, 0)
+            # run() fetches page 1 once up front (init/test-latest view) and then the
+            # walker paginates from page 1: pages 1, 2, 3 (page 3 stopped it, no new ids).
+            self.assertEqual(scripted.requested_pages, [1, 1, 2, 3])
+            # The walker itself reached page 3.
+            self.assertIn(3, scripted.requested_pages)
+            # Notified posts came from BOTH page 1 (id 20) and page 2 (ids 21, 22),
+            # sorted by (post_date, id); already-seen id 1 excluded.
+            self.assertEqual([p["id"] for p in sent["posts"]], [20, 21, 22])
+
+            # State now includes ids from all fetched pages (1 already seen + 20,21,22).
+            loaded = bot.load_state(state_path)
+            saved_seen = set(loaded["streams"][bot.make_stream_key(BASE_URL)]["seen_ids"])
+            self.assertEqual(saved_seen, {1, 20, 21, 22})
+
+    def test_run_single_page_is_regression_safe(self):
+        # With only page 1 populated (page 2 empty), behaviour equals the legacy
+        # single-page path: the one new post is notified, both ids stored.
+        with tempfile.TemporaryDirectory() as d:
+            state_path = Path(d) / "state.json"
+            bot.save_state(state_path, self._state_with_seen([100]))
+
+            cfg = _make_config(
+                dry_run=False,
+                slack_webhook_url="https://example/webhook",
+                state_path=state_path,
+            )
+
+            scripted = _ScriptedPages({
+                1: [_raw_item(100, post_date="2026.01.01"), _raw_item(101, post_date="2026.03.03")],
+            })
+
+            captured = {}
+
+            with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                    mock.patch.object(bot, "fetch_notices", side_effect=scripted), \
+                    mock.patch.object(bot, "send_slack_message"), \
+                    mock.patch.object(bot, "build_slack_summary_text", side_effect=lambda *, posts, **k: captured.update(posts=list(posts)) or "text"):
+                rc = bot.run(cfg)
+
+            self.assertEqual(rc, 0)
+            # run() fetches page 1 once up front, then the walker: page 1 had a new id
+            # -> page 2 probed (empty) -> stop.
+            self.assertEqual(scripted.requested_pages, [1, 1, 2])
+            self.assertEqual([p["id"] for p in captured["posts"]], [101])
+            loaded = bot.load_state(state_path)
+            saved_seen = set(loaded["streams"][bot.make_stream_key(BASE_URL)]["seen_ids"])
+            self.assertEqual(saved_seen, {100, 101})
+
+
+class MainStringExitCodeTests(unittest.TestCase):
+    """main() must treat a SystemExit raised with a *string* code (as _require
+    does for a missing webhook, e.g. SystemExit('SLACK_WEBHOOK_URL이 필요합니다.'))
+    as a failure: route it through _report_failure (attempting a Slack failure
+    notification when a webhook is configured) and re-raise SystemExit(2)."""
+
+    def test_string_exit_code_from_run_maps_to_failure_and_nonzero(self):
+        cfg = _make_config(
+            dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        calls = []
+
+        def _record(*args, **kwargs):
+            calls.append(kwargs)
+
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(
+                    bot, "run", side_effect=SystemExit("SLACK_WEBHOOK_URL이 필요합니다.")
+                ), mock.patch.object(bot, "send_slack_message", side_effect=_record), \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        # Non-zero, non-None exit code (specifically 2).
+        self.assertEqual(ctx.exception.code, 2)
+        # A failure notification was attempted; the string reason is surfaced as
+        # the error summary and the [ERROR] fallback text is used.
+        self.assertTrue(calls, "expected a failure Slack call")
+        self.assertTrue(any("[ERROR]" in c.get("text", "") for c in calls))
+
+    def test_string_exit_code_without_webhook_still_exits_nonzero_no_slack(self):
+        # No webhook configured -> _report_failure skips Slack, but the exit is
+        # still a non-zero failure code.
+        cfg = _make_config(dry_run=False, slack_webhook_url=None)
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(
+                    bot, "run", side_effect=SystemExit("알림을 보낼 수 없습니다.")
+                ), mock.patch.object(bot, "send_slack_message") as send, \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        self.assertEqual(ctx.exception.code, 2)
+        send.assert_not_called()
+
+    def test_run_returning_zero_exits_zero_with_no_failure_notification(self):
+        cfg = _make_config(
+            dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "run", return_value=0), \
+                mock.patch.object(bot, "send_slack_message") as send, \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        # Clean exit (code 0 or None), and NO failure notification attempted.
+        self.assertIn(ctx.exception.code, (0, None))
+        send.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

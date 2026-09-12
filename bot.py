@@ -53,6 +53,10 @@ POST_PATH = "/post"
 # seen_ids가 무한정 커지지 않도록 보관 상한(가장 큰 id 기준 최신 N개만 유지).
 MAX_SEEN_IDS = 2000
 
+# 페이지네이션 안전 상한. 오작동하거나 무한히 페이지를 내려주는 API가 있어도
+# fetch_all_new_notices가 무한 루프에 빠지지 않도록 하는 하드 캡입니다.
+MAX_FETCH_PAGES = 10
+
 
 def _parse_bool(value: Optional[str], *, default: bool = False) -> bool:
     if value is None:
@@ -403,6 +407,89 @@ def fetch_notices(
     if not isinstance(items, list):
         raise RuntimeError(f"공지 API 응답에 'list'가 없습니다: {str(data)[:200]!r}")
     return items
+
+
+def fetch_all_new_notices(
+    session: requests.Session,
+    *,
+    base_url: str,
+    seen_ids: "set[int]",
+    max_pages: int = MAX_FETCH_PAGES,
+    timeout_sec: float = 15.0,
+) -> "tuple[List[Dict[str, Any]], List[int]]":
+    """
+    다운타임/버스트 이후 2페이지 이상 쌓인 새 공지를 놓치지 않도록,
+    page=1부터 시작해 새 글이 더 이상 없을 때까지 페이지를 이어서 조회합니다.
+
+    각 페이지에 대해:
+      - 기존 fetch_notices를 그대로 호출(HTML drift / JSON 파싱 실패 시
+        RuntimeError를 그대로 전파),
+      - normalize_notice로 정규화하고 id>0 항목만 취합,
+      - 지금까지 모은 정규화 공지(notices)와 current_ids(전 페이지 합집합)에 누적합니다.
+
+    다음 중 하나가 만족되면 페이지 조회를 멈춥니다.
+      1) raw 페이지가 비어 있음(더 이상 글이 없음),
+      2) 해당 페이지가 '새 글'을 하나도 기여하지 못함
+         (= 이 페이지의 id가 전부 이미 본 글(seen_ids)이거나 앞 페이지에서 이미
+            취합한 글(중복 고정 공지 등)뿐이므로, 더 깊은 페이지는 더 오래된 글이라
+            역시 이미 봤다고 간주),
+      3) max_pages에 도달(안전 상한).
+
+    가정: 이 API는 최신 글이 앞 페이지에 오는 안정적인 정렬을 유지합니다.
+    id는 단조증가하지 않고 1페이지에 고정(pinned) 공지가 섞일 수 있으므로,
+    '이 페이지가 기여한 새 글'은 seen_ids에도 없고 앞 페이지에서 이미 취합하지도
+    않은 id로만 계산합니다. 덕분에 이미 취합한 고정 공지가 다시 실린 페이지 때문에
+    불필요하게 한 페이지를 더 조회하는 일이 없습니다.
+    어떤 경우에도 max_pages 안전 상한이 종료를 보장합니다.
+
+    ※ 정렬 가정이 깨지면(최신 글이 뒤 페이지로 오는 등) 조건 2가 실제보다 일찍
+    참이 되어 오래됐지만 아직 안 본 글을 놓칠 수 있습니다. 이 봇이 다시 백로그를
+    놓치기 시작하면 '업스트림 API의 페이지 정렬이 바뀌었는지'를 가장 먼저 확인하세요.
+
+    반환: (조회한 모든 페이지의 정규화 공지 리스트, 전 페이지 current_ids 합집합)
+    """
+    cap = max(1, int(max_pages))
+    all_notices: List[Dict[str, Any]] = []
+    all_current_ids: List[int] = []
+    accumulated_ids: "set[int]" = set()  # 페이지 간 중복(고정 공지 등) 제거용
+
+    for page in range(1, cap + 1):
+        raw_items = fetch_notices(session, base_url=base_url, page=page, timeout_sec=timeout_sec)
+        if not raw_items:
+            # 더 이상 글이 없는 빈 페이지 → 종료.
+            break
+
+        page_notices = [
+            normalize_notice(it, base_url=base_url)
+            for it in raw_items
+            if int(it.get("id", 0)) > 0
+        ]
+        page_ids = [p["id"] for p in page_notices]
+
+        # 페이지 간에 같은 글(예: 고정 공지)이 중복될 수 있으므로 id 기준으로 한 번만 취합.
+        # 이 페이지가 새로 추가한 id(앞 페이지에 없던 것)를 따로 모아 종료 판정에 씁니다.
+        newly_added_ids: "set[int]" = set()
+        for p in page_notices:
+            if p["id"] not in accumulated_ids:
+                accumulated_ids.add(p["id"])
+                all_notices.append(p)
+                all_current_ids.append(p["id"])
+                newly_added_ids.add(p["id"])
+
+        # 이 페이지가 '새 글'을 실제로 기여했을 때만 다음 페이지를 조회합니다.
+        # '기여한 새 글'은 seen_ids에 없으면서(=아직 못 본) 앞선 페이지에서 이미
+        # 취합하지도 않은(=accumulated_ids에 없던) id입니다.
+        # accumulated_ids는 이 페이지의 항목까지 이미 반영된 상태이므로, 그 차집합을
+        # 다시 계산하는 대신 위 취합 루프에서 이 페이지가 새로 추가한 id가 있었는지로 판정합니다.
+        # 이렇게 하면 page_ids만 보던 기존 방식과 달리, 앞 페이지에서 이미 모은 고정(pinned)
+        # 공지가 아직 seen_ids에 없다는 이유만으로 다음 페이지를 한 번 더 조회하는 낭비를 없앱니다.
+        contributed_new = any(
+            pid in newly_added_ids and pid not in seen_ids for pid in page_ids
+        )
+        if not contributed_new:
+            break
+
+    return all_notices, all_current_ids
 
 
 def send_slack_message(
@@ -783,7 +870,10 @@ def run(cfg: Config) -> int:
             "SLACK_WEBHOOK_URL(또는 Notion 설정)이 없어 알림을 보낼 수 없습니다.",
         )
 
-    # 현재 공지 목록 조회(정규화)
+    # 현재 공지 목록 조회(정규화).
+    # test-latest / init / 최초 실행 경로는 '현재 화면(1페이지)'만 필요하므로 page=1만 조회하며,
+    # 이들 경로의 동작은 예전과 동일합니다. 실제 알림 경로에서만 아래에서
+    # fetch_all_new_notices로 새 글이 없어질 때까지 여러 페이지를 이어서 조회합니다.
     raw_items = fetch_notices(get_session(), base_url=cfg.base_url, page=1)
     notices = [normalize_notice(it, base_url=cfg.base_url) for it in raw_items if int(it.get("id", 0)) > 0]
     current_ids = [p["id"] for p in notices]
@@ -824,6 +914,20 @@ def run(cfg: Config) -> int:
         seen_ids: set[int] = set()
     else:
         seen_ids = set(int(x) for x in stream.get("seen_ids", []))
+
+    # 다운타임/버스트로 2페이지 이상 새 글이 쌓였을 수 있으므로, 실제 알림 경로에서는
+    # seen_ids 기준으로 새 글이 없어질 때까지 페이지를 이어서 조회합니다.
+    # (page=1만 조회하던 기존 동작은 단일 페이지 시나리오에서 결과가 동일합니다.)
+    #
+    # NOTE(의도된 tradeoff, FEAT-001): 위에서 init/test-latest/최초 실행 공용 뷰를 만들기
+    # 위해 page=1을 이미 한 번 조회했고, 여기서 walker가 다시 page=1부터 시작하므로 실제
+    # 알림 경로는 매 실행 page=1을 두 번 조회합니다. 위의 선(先)조회 결과를 walker의 첫
+    # 페이지로 넘겨 중복을 없앨 수도 있지만, 그러면 walker 시그니처와 init/최초 실행/
+    # test-latest 경로의 흐름이 복잡해집니다. 소스가 rate-sensitive해지지 않는 한 이 중복은
+    # 그대로 두는 것이 코드가 더 읽기 쉽다는 판단으로 FEAT-001에서 명시적으로 수용했습니다.
+    notices, current_ids = fetch_all_new_notices(
+        get_session(), base_url=cfg.base_url, seen_ids=seen_ids
+    )
 
     new_posts = [p for p in notices if p["id"] not in seen_ids]
     # 오래된 것부터(날짜, id) 정렬 — 날짜 동일/누락 시 id로 안정 정렬
