@@ -650,5 +650,75 @@ class PaginationRunTests(unittest.TestCase):
             self.assertEqual(saved_seen, {100, 101})
 
 
+class MainStringExitCodeTests(unittest.TestCase):
+    """main() must treat a SystemExit raised with a *string* code (as _require
+    does for a missing webhook, e.g. SystemExit('SLACK_WEBHOOK_URL이 필요합니다.'))
+    as a failure: route it through _report_failure (attempting a Slack failure
+    notification when a webhook is configured) and re-raise SystemExit(2)."""
+
+    def test_string_exit_code_from_run_maps_to_failure_and_nonzero(self):
+        cfg = _make_config(
+            dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        calls = []
+
+        def _record(*args, **kwargs):
+            calls.append(kwargs)
+
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(
+                    bot, "run", side_effect=SystemExit("SLACK_WEBHOOK_URL이 필요합니다.")
+                ), mock.patch.object(bot, "send_slack_message", side_effect=_record), \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        # Non-zero, non-None exit code (specifically 2).
+        self.assertEqual(ctx.exception.code, 2)
+        # A failure notification was attempted; the string reason is surfaced as
+        # the error summary and the [ERROR] fallback text is used.
+        self.assertTrue(calls, "expected a failure Slack call")
+        self.assertTrue(any("[ERROR]" in c.get("text", "") for c in calls))
+
+    def test_string_exit_code_without_webhook_still_exits_nonzero_no_slack(self):
+        # No webhook configured -> _report_failure skips Slack, but the exit is
+        # still a non-zero failure code.
+        cfg = _make_config(dry_run=False, slack_webhook_url=None)
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(
+                    bot, "run", side_effect=SystemExit("알림을 보낼 수 없습니다.")
+                ), mock.patch.object(bot, "send_slack_message") as send, \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        self.assertEqual(ctx.exception.code, 2)
+        send.assert_not_called()
+
+    def test_run_returning_zero_exits_zero_with_no_failure_notification(self):
+        cfg = _make_config(
+            dry_run=False, slack_webhook_url="https://example/webhook"
+        )
+        with mock.patch.object(bot, "_requests_session", return_value=_FakeSession()), \
+                mock.patch.object(bot, "run", return_value=0), \
+                mock.patch.object(bot, "send_slack_message") as send, \
+                mock.patch.object(
+                    bot, "build_config_from_env_and_args", return_value=cfg
+                ), mock.patch.object(bot, "parse_args", return_value=None), \
+                mock.patch.object(sys, "argv", ["bot.py"]):
+            with self.assertRaises(SystemExit) as ctx:
+                bot.main()
+
+        # Clean exit (code 0 or None), and NO failure notification attempted.
+        self.assertIn(ctx.exception.code, (0, None))
+        send.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
