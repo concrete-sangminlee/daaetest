@@ -543,6 +543,29 @@ class FetchAllNewNoticesTests(unittest.TestCase):
         self.assertEqual([p["id"] for p in notices], [500, 401, 402])
         self.assertEqual(current_ids, [500, 401, 402])
 
+    def test_pinned_only_unseen_id_on_later_page_does_not_over_walk(self):
+        # A still-unseen pinned notice (id 500) sits on page 1 and is repeated on
+        # page 2, but page 2 is otherwise entirely already-seen. Page 2 therefore
+        # contributes no NEW post (500 was already accumulated on page 1; the rest
+        # are in seen_ids), so the walker must stop and NOT fetch page 3.
+        # 'has_new' is computed against ids not already accumulated AND unseen, so
+        # the already-collected pinned id no longer keeps the walk alive by itself.
+        scripted = _ScriptedPages({
+            1: [_raw_item(500), _raw_item(601)],
+            2: [_raw_item(500), _raw_item(10)],  # 500 already accumulated, 10 already seen
+            3: [_raw_item(700)],  # must never be requested
+        })
+        seen = {10}
+        with mock.patch.object(bot, "fetch_notices", side_effect=scripted):
+            notices, current_ids = bot.fetch_all_new_notices(
+                _FakeSession(), base_url=BASE_URL, seen_ids=seen
+            )
+        # Page 2 fetched (id 10 collected) but page 3 NOT fetched.
+        self.assertEqual(scripted.requested_pages, [1, 2])
+        # 500 collected once, 601 (new), 10 (seen but still accumulated on this run).
+        self.assertEqual([p["id"] for p in notices], [500, 601, 10])
+        self.assertEqual(current_ids, [500, 601, 10])
+
     def test_html_drift_runtimeerror_propagates(self):
         def _drift(session, *, base_url, page=1, timeout_sec=15.0):
             raise RuntimeError("공지 API가 JSON 대신 HTML(SPA 페이지)을 반환했습니다.")
