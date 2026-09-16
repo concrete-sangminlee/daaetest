@@ -5,9 +5,6 @@ on:
     # GitHub Actions cron은 UTC 기준입니다.
     # 최소 주기는 5분이며, 필요하면 */5로 조정하세요.
     - cron: "*/10 * * * *"
-    # 매일 00:00 UTC(=09:00 KST)에 실행되는 heartbeat용 스케줄.
-    # 이 시각에도 위 10분 주기 알림은 그대로 동작하고, 추가로 heartbeat 1건을 보냅니다.
-    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       ping:
@@ -110,16 +107,3 @@ jobs:
             git pull --rebase --autostash origin "${{ github.ref_name }}"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-
-      # 정기 생존 신호(heartbeat): 매일 00:00 UTC 스케줄에서만 전송합니다.
-      # continue-on-error로 heartbeat 실패가 워크플로우(본 알림)를 실패시키지 않도록 합니다.
-      - name: Heartbeat (daily)
-        if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 0 * * *' }}
-        continue-on-error: true
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          BASE_URL: "https://architecture.snu.ac.kr"
-          ALERT_FEED_NAME: "건축학과"
-          ALERT_EMOJI: "💚"
-        run: |
-          python bot.py --heartbeat
