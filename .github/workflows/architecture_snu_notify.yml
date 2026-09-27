@@ -2,9 +2,11 @@ name: Notify new posts from architecture.snu.ac.kr
 
 on:
   schedule:
-    # GitHub Actions cron은 UTC 기준입니다.
-    # 최소 주기는 5분이며, 필요하면 */5로 조정하세요.
-    - cron: "*/10 * * * *"
+    # GitHub Actions cron은 UTC 기준입니다(KST = UTC + 9시간).
+    # 매일 한국시간(KST) 아래 3개 시각에만 실행합니다.
+    - cron: "13 1 * * *"   # KST 10:13 (= UTC 01:13)
+    - cron: "22 5 * * *"   # KST 14:22 (= UTC 05:22)
+    - cron: "42 10 * * *"  # KST 19:42 (= UTC 10:42)
   workflow_dispatch:
     inputs:
       ping:
