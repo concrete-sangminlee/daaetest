@@ -3,6 +3,10 @@
   "streams": {
     "https://architecture.snu.ac.kr/rest/activities/getNotices": {
       "seen_ids": [
+        25413,
+        25412,
+        25411,
+        25410,
         25408,
         25407,
         25406,
@@ -56,7 +60,7 @@
         25338,
         25312
       ],
-      "updated_at": "2026-10-05T19:23:49.615779+00:00"
+      "updated_at": "2026-10-06T07:35:28.484116+00:00"
     }
   }
 }
